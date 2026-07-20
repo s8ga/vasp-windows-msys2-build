@@ -170,11 +170,22 @@ unpack() {
   rm -rf "${WORK_DIR}"
   mkdir -p "${WORK_DIR}"
   log "extracting ${VASP_TARBALL} ..."
+  # On Windows, relative symlinks under testsuite/POTCARS often fail and make
+  # GNU tar exit non-zero. Those links are not required to compile VASP — keep
+  # going if src/ is present.
+  set +e
   tar -xf "${VASP_TARBALL}" -C "${WORK_DIR}"
+  local tar_rc=$?
+  set -e
+  if [ "${tar_rc}" -ne 0 ]; then
+    warn "tar exited ${tar_rc} (often Windows symlink failures under testsuite/POTCARS); continuing if src/ exists"
+  fi
 
   # locate the source root = directory containing src/
   SRC_ROOT="$(find "${WORK_DIR}" -maxdepth 2 -type d -name src -printf '%h\n' | head -1)"
   [ -n "${SRC_ROOT}" ] || die "could not find a 'src/' dir in the tarball"
+  # setup.sh expects testsuite/ to exist even if POTCAR symlinks were skipped
+  mkdir -p "${SRC_ROOT}/testsuite"
   log "source root: ${SRC_ROOT}"
 
   # stage the CMake port at <root>/cmake/ (overwrite if present)
@@ -230,6 +241,43 @@ patch_sources() {
 }
 
 #-----------------------------------------------------------------------------
+# MPI_IN_PLACE --wrap shim (gfortran + MS-MPI sentinel mismatch)
+# See shim/msmpi_inplace_wrap.c and docs/MSYS2_MSMPI_MULTIRANK.md
+#
+# IMPORTANT: do NOT put --wrap / wrap.o into CMAKE_EXE_LINKER_FLAGS — that
+# breaks CMake's Fortran try_compile. Inject per-target via
+# CMAKE_PROJECT_TOP_LEVEL_INCLUDES + shim/cmake_msmpi_wrap_inject.cmake.
+#-----------------------------------------------------------------------------
+MSMPI_WRAP_SRC="${MSMPI_WRAP_SRC:-${SCRIPT_DIR}/shim/msmpi_inplace_wrap.c}"
+MSMPI_WRAP_INJECT="${MSMPI_WRAP_INJECT:-${SCRIPT_DIR}/shim/cmake_msmpi_wrap_inject.cmake}"
+# Symbols discovered via nm on vasp_std (collectives / RMA that may see IN_PLACE or BOTTOM)
+MSMPI_WRAP_SYMS="${MSMPI_WRAP_SYMS:-mpi_allreduce_ mpi_reduce_ mpi_allgather_ mpi_allgatherv_ mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_get_}"
+
+msmpi_wrap_syms_cmake() { # semicolon-separated list for CMake cache
+  local s out=""
+  for s in ${MSMPI_WRAP_SYMS}; do
+    if [ -z "${out}" ]; then out="${s}"; else out="${out};${s}"; fi
+  done
+  printf '%s' "${out}"
+}
+
+compile_msmpi_wrap() { # compile_msmpi_wrap <outdir> -> sets MSMPI_WRAP_OBJ (mixed path)
+  local outdir="$1"
+  mkdir -p "${outdir}"
+  local obj_unix="${outdir}/msmpi_inplace_wrap.o"
+  [ -f "${MSMPI_WRAP_SRC}" ] || die "missing MS-MPI wrap shim: ${MSMPI_WRAP_SRC}"
+  [ -f "${MSMPI_WRAP_INJECT}" ] || die "missing MS-MPI wrap CMake inject: ${MSMPI_WRAP_INJECT}"
+  gcc -c "${MSMPI_WRAP_SRC}" -I"${MINGW_PREFIX}/include" -o "${obj_unix}"
+  # Ninja/cmd.exe linker prefers Windows mixed paths over /c/...
+  if command -v cygpath >/dev/null 2>&1; then
+    MSMPI_WRAP_OBJ="$(cygpath -m "${obj_unix}")"
+  else
+    MSMPI_WRAP_OBJ="${obj_unix}"
+  fi
+  log "compiled MS-MPI IN_PLACE wrap: ${MSMPI_WRAP_OBJ}"
+}
+
+#-----------------------------------------------------------------------------
 # [4] configure — cmake (Ninja)
 #-----------------------------------------------------------------------------
 configure() {
@@ -238,6 +286,16 @@ configure() {
   rm -rf "${BDIR}"
   mkdir -p "${BDIR}"
   local jobs; jobs="$(compute_jobs)"
+  compile_msmpi_wrap "${BDIR}"
+  local wrap_syms_cm; wrap_syms_cm="$(msmpi_wrap_syms_cmake)"
+  local inject_path
+  if command -v cygpath >/dev/null 2>&1; then
+    inject_path="$(cygpath -m "${MSMPI_WRAP_INJECT}")"
+  else
+    inject_path="${MSMPI_WRAP_INJECT}"
+  fi
+  log "MS-MPI wrap symbols: ${wrap_syms_cm}"
+  log "CMAKE_PROJECT_TOP_LEVEL_INCLUDES=${inject_path}"
   cmake -S "${SRC_ROOT}" -B "${BDIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_Fortran_COMPILER=gfortran \
@@ -250,6 +308,9 @@ configure() {
     -DVASP_SYSV=OFF \
     -DVASP_TARGET_CPU="${TARGET_CPU}" \
     -DCMAKE_EXE_LINKER_FLAGS="-Wl,--stack,268435456" \
+    -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${inject_path}" \
+    -DVASP_MSMPI_WRAP_OBJ="${MSMPI_WRAP_OBJ}" \
+    -DVASP_MSMPI_WRAP_SYMS="${wrap_syms_cm}" \
     -DBLA_VENDOR=OpenBLAS \
     -DLAPACK_DIR="${MINGW_PREFIX}/lib" \
     -DFFTW_ROOT="${MINGW_PREFIX}" \
@@ -312,26 +373,33 @@ harvest() {
     done < <(dll_deps "$exe")
   done
 
-  # 3) MS-MPI launcher (mpiexec/smpd) — required for portable multi-core launch
+  # 3) MS-MPI launcher (mpiexec/smpd) — required for portable multi-core launch.
+  # Prefer official Microsoft MPI (Program Files) over PATH/Scoop redistributable.
+  # winget Microsoft.msmpi puts mpiexec/smpd in Bin, msmpi.dll/msmpires.dll in System32.
   local mpibin mpiexec_bin mpiexec_dir=""
   mpiexec_bin="$(command -v mpiexec 2>/dev/null || true)"
   [ -n "${mpiexec_bin}" ] && mpiexec_dir="$(dirname "${mpiexec_bin}")"
   mpibin="$(first_existing \
       "${MSMPI_BIN:-EMPTY}" \
-      "${mpiexec_dir:-EMPTY}" \
-      "${HOME}/scoop/apps/msmpi/current" \
       "/c/Program Files/Microsoft MPI/Bin" \
       "/c/Program Files (x86)/Microsoft MPI/Bin" \
+      "${mpiexec_dir:-EMPTY}" \
+      "${HOME}/scoop/apps/msmpi/current" \
       "${MINGW_PREFIX}/bin" || true)"
   # Scoop "current" is a symlink; plain find -P does not list its children.
   if [ -n "${mpibin}" ] && [ -d "${mpibin}" ]; then
     mpibin="$(cd "${mpibin}" && pwd -P)"
   fi
-  local m f
+  local m f sys32="/c/Windows/System32"
   for m in mpiexec.exe smpd.exe msmpi.dll msmpires.dll; do
     f="${mpibin}/${m}"
+    if [ ! -f "$f" ] && [ -f "${sys32}/${m}" ]; then
+      f="${sys32}/${m}"
+    fi
     if [ -f "$f" ]; then
       cp -f "$f" "${PKG_DIR}/bin/$m" && log "  + $m"
+    else
+      warn "MS-MPI file not found for harvest: $m (set MSMPI_BIN or install Microsoft.msmpi)"
     fi
   done
 
@@ -387,6 +455,9 @@ REM a single BLAS thread, otherwise cores are oversubscribed and OpenBLAS's
 REM buffer allocator can fail. Pin both vars (OMP_NUM_THREADS is authoritative).
 set OMP_NUM_THREADS=1
 set OPENBLAS_NUM_THREADS=1
+REM Multi-rank MS-MPI requires the MPI_IN_PLACE --wrap shim linked at build
+REM time (shim/msmpi_inplace_wrap.c). See docs/MSYS2_MSMPI_MULTIRANK.md.
+REM Optional: set MSMPI_WRAP_DEBUG=1 to log sentinel rewrites.
 echo Starting VASP on 4 cores...
 .\bin\mpiexec.exe -n 4 .\bin\vasp_std.exe
 pause
