@@ -19,7 +19,8 @@ binaries.** You must provide your own licensed VASP tarball outside this repo.
 
 | Item | Role |
 |---|---|
-| `build_pipeline.sh` | One-command driver (preflight → zip) |
+| `build_pipeline.sh` | **Single source of truth** — one-command driver (preflight → zip) |
+| `toolchain/` | Thin English entry points (deps / env / call pipeline) |
 | `patches/` | Win32 timing patches (`getrusage` → `GetProcessTimes`) |
 | `vasp_cmake/` | Official VASP CMake port (**git submodule**) |
 
@@ -28,43 +29,13 @@ excluded. See [docs/DESIGN.md](docs/DESIGN.md) for a short design pointer.
 
 ---
 
-## 2. Prerequisites (build host)
+## 2. Quick start: Clone → deps → build
 
-### 2.1 MSYS2 UCRT64
+All build steps below run in an **MSYS2 UCRT64** shell unless noted.
+Install [MSYS2](https://www.msys2.org/) first if needed (Scoop is fine:
+`scoop install msys2`). No Visual Studio and no Intel oneAPI are required.
 
-Install [MSYS2](https://www.msys2.org/) (Scoop is fine: `scoop install msys2`).
-Open the **UCRT64** shell and install:
-
-```bash
-pacman -S --needed \
-  mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-fortran \
-  mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-cmake \
-  mingw-w64-ucrt-x86_64-ninja \
-  mingw-w64-ucrt-x86_64-msmpi \
-  mingw-w64-ucrt-x86_64-openblas mingw-w64-ucrt-x86_64-scalapack \
-  mingw-w64-ucrt-x86_64-fftw mingw-w64-ucrt-x86_64-hdf5 \
-  mingw-w64-ucrt-x86_64-ntldd git tar zip
-```
-
-### 2.2 Host Microsoft MPI (launcher)
-
-Needed so the pipeline can harvest `mpiexec.exe` / `smpd.exe` / `msmpi.dll`
-into the portable package. Either:
-
-```powershell
-scoop install msmpi
-```
-
-or install the official runtime (`msmpisetup.exe`) from
-<https://www.microsoft.com/download/details.aspx?id=100362>.
-
-Optional override: `MSMPI_BIN=/c/path/to/Microsoft MPI/Bin`.
-
-No Visual Studio and no Intel oneAPI are required.
-
----
-
-## 3. Clone this repo (with submodule)
+### 2.1 Clone (with submodule)
 
 ```bash
 git clone --recurse-submodules <this-repo-url>
@@ -81,9 +52,29 @@ The submodule lives at `vasp_cmake/` (upstream
 [vasp-dev/cmake](https://github.com/vasp-dev/cmake), branch `6.6.x`).
 `build_pipeline.sh` expects that path by default (`VASP_CMAKE_DIR`).
 
----
+### 2.2 Install deps (`toolchain/`)
 
-## 4. Get the VASP tarball yourself
+In **UCRT64**:
+
+```bash
+bash toolchain/install_deps_msys2.sh
+```
+
+That installs the pacman packages (gcc/gfortran, cmake, ninja, msmpi,
+OpenBLAS, ScaLAPACK, FFTW, HDF5, ntldd, …). Separately, install **host**
+Microsoft MPI so the pipeline can harvest `mpiexec.exe` / `smpd.exe` /
+`msmpi.dll` into the portable package:
+
+```powershell
+scoop install msmpi
+```
+
+or the official runtime (`msmpisetup.exe`) from
+<https://www.microsoft.com/download/details.aspx?id=100362>.
+
+Optional override: `MSMPI_BIN=/c/path/to/Microsoft MPI/Bin`.
+
+### 2.3 Get the VASP tarball yourself
 
 Download your licensed VASP 6.6.x source archive from the VASP portal and keep
 it **outside** this repository, for example:
@@ -95,17 +86,21 @@ it **outside** this repository, for example:
 Do not commit tarballs, extracted `vasp.*/` trees, or `POTCAR` / `potpaw*`
 files. They are gitignored on purpose.
 
----
-
-## 5. Build (one command)
-
-In the **MSYS2 UCRT64** shell, from this folder:
+### 2.4 Build via toolchain
 
 ```bash
-VASP_TARBALL=/c/path/to/vasp.6.6.0.tar.gz bash build_pipeline.sh
+bash toolchain/build_vasp.sh /c/path/to/vasp.6.6.0.tar.gz
 ```
 
 Or:
+
+```bash
+VASP_TARBALL=/c/path/to/vasp.6.6.0.tar.gz bash toolchain/build_vasp.sh
+```
+
+`toolchain/build_vasp.sh` sources `toolchain/env_ucrt64.sh` (PATH /
+`MINGW_PREFIX` / `MSMPI_BIN`) then execs root **`build_pipeline.sh`**.
+You may still call the pipeline directly:
 
 ```bash
 bash build_pipeline.sh /c/path/to/vasp.6.6.0.tar.gz
@@ -132,7 +127,7 @@ For a stage-by-stage walkthrough, see [STEP_BY_STEP.md](STEP_BY_STEP.md).
 
 ---
 
-## 6. Portable ZIP usage
+## 3. Portable ZIP usage
 
 Unzip anywhere. Place `INCAR`, `POSCAR`, `POTCAR`, `KPOINTS` next to `run.bat`,
 then double-click **`run.bat`** (4-rank MS-MPI by default):
@@ -163,7 +158,7 @@ does not oversubscribe cores under MPI.
 
 ---
 
-## 7. What we patch (and why)
+## 4. What we patch (and why)
 
 Only two **timing/reporting** C files get a Win32 branch
 (`src/lib/dclock_.c`, `src/lib/timing_.c`). MinGW-w64 does not provide
@@ -177,7 +172,7 @@ Everything else uses official CMake options (`VASP_SHMEM=OFF`, `VASP_SYSV=OFF`,
 
 ---
 
-## 8. Troubleshooting
+## 5. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -190,6 +185,7 @@ Everything else uses official CMake options (`VASP_SHMEM=OFF`, `VASP_SYSV=OFF`,
 | Real MinGW DLL `not found` | Check Scoop-resolved `MINGW_PREFIX`; re-run harvest or copy missing DLL into `bin/` |
 | OpenBLAS crash under MPI | Keep `OMP_NUM_THREADS=1` / `OPENBLAS_NUM_THREADS=1` in `run.bat` |
 | Missing `mpiexec.exe` in package | Install host MS-MPI (`scoop install msmpi` or official setup); set `MSMPI_BIN` if needed |
+| `mpiexec -n 2` crashes (MSYS2/MS-MPI); `-n 1` OK | **Fixed in current builds** via linker `--wrap` shim -- see [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md) and [docs/MSYS2_MSMPI_MULTIRANK.md](docs/MSYS2_MSMPI_MULTIRANK.md). Rebuild with current `build_pipeline.sh`. Older ZIPs without the shim: use `-n 1` or an Intel MPI package |
 
 ---
 
