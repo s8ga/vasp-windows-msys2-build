@@ -1,0 +1,50 @@
+# Build scratch / extracted trees
+build_work/
+**/build_work/
+vasp.*/
+
+# Portable package outputs (ZIP + unpacked dirs)
+*.zip
+*.sha256
+vasp-*-msys2-portable/
+
+# Source / archive inputs (licensed — never commit)
+*.tgz
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+vasp*.zip
+
+# Pseudopotentials (licensed)
+POTCAR
+potpaw*
+**/POTCAR
+**/potpaw*
+
+# Generated binaries / package contents
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.mod
+*.pdb
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*

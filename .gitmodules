@@ -1,0 +1,4 @@
+[submodule "vasp_cmake"]
+	path = vasp_cmake
+	url = https://github.com/vasp-dev/cmake.git
+	branch = 6.6.x

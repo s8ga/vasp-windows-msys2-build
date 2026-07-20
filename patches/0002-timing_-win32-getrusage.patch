@@ -1,0 +1,88 @@
+diff --git a/src/lib/timing_.c b/src/lib/timing_.c
+index f25a454..3bc79d8 100644
+--- a/src/lib/timing_.c
++++ b/src/lib/timing_.c
+@@ -1,6 +1,17 @@
+ /* provide some timing and resource usage data (CPU, wall clock, memory, ...) */
+ 
++#ifdef _WIN32
++#include <windows.h>
++static double win32_filetime_to_sec(const FILETIME *ft)
++{
++    ULARGE_INTEGER uli;
++    uli.LowPart  = ft->dwLowDateTime;
++    uli.HighPart = ft->dwHighDateTime;
++    return (double)uli.QuadPart / 1e7;
++}
++#else
+ #include <sys/resource.h>  // for getrusage(), struct rusage
++#endif
+ #include <time.h>          // for clock_gettime(), struct timespec
+ 
+ 
+@@ -8,10 +19,37 @@ void timing_C(int *mode, double *utime, double *stime, double *now,
+               int *minpgf, int *majpgf, double *maxrsize, double *avsize,
+               int *swaps, int *ios, int *cswitch, int *ierr)
+ {
+-    struct rusage rudata;
+     struct timespec realtime;
++
++#ifdef _WIN32
++    /* Windows lacks getrusage(). GetProcessTimes() covers only the current
++       process (no aggregate for children); memory/page-fault counters are
++       not available without psapi and are reported as zero. This affects
++       OUTCAR reporting only, never the physics. */
++    FILETIME _dummy_creat, _dummy_exit, ft_kernel, ft_user;
++    if (*mode == 0 && GetProcessTimes(GetCurrentProcess(), &_dummy_creat,
++                                      &_dummy_exit, &ft_kernel, &ft_user))
++    {
++        *utime = win32_filetime_to_sec(&ft_user);
++        *stime = win32_filetime_to_sec(&ft_kernel);
++    }
++    else
++    {
++        /* mode != 0 (children): no aggregate available on Windows */
++        *utime = 0.0;
++        *stime = 0.0;
++    }
++    *ierr    = 0;
++    *minpgf  = 0;
++    *majpgf  = 0;
++    *maxrsize = 0.0;
++    *avsize  = 0.0;
++    *swaps   = 0;
++    *ios     = 0;
++    *cswitch = 0;
++#else
++    struct rusage rudata;
+     double intsize, totaltime;
+-    int dumerr;
+ 
+     if (*mode == 0) {
+         *ierr = getrusage(RUSAGE_SELF, &rudata);
+@@ -22,11 +60,6 @@ void timing_C(int *mode, double *utime, double *stime, double *now,
+     *utime = (double)rudata.ru_utime.tv_sec + (double)rudata.ru_utime.tv_usec / 1.0e6;
+     *stime = (double)rudata.ru_stime.tv_sec + (double)rudata.ru_stime.tv_usec / 1.0e6;
+ 
+-    dumerr = clock_gettime(CLOCK_REALTIME, &realtime);
+-    (void)dumerr;  // silence unused variable warning if not used
+-
+-    *now = (double) realtime.tv_sec + (double) realtime.tv_nsec / 1.0e9;
+-
+     totaltime = *utime + *stime;
+     if (totaltime <= 0.0) totaltime = 1.0;  // prevent division by zero
+ 
+@@ -40,5 +73,12 @@ void timing_C(int *mode, double *utime, double *stime, double *now,
+     *swaps    = rudata.ru_nswap;
+     *ios      = rudata.ru_inblock + rudata.ru_oublock;
+     *cswitch  = rudata.ru_nvcsw;
+-}
++#endif
+ 
++    {
++        int dumerr = clock_gettime(CLOCK_REALTIME, &realtime);
++        (void)dumerr;  // silence unused variable warning if not used
++    }
++
++    *now = (double) realtime.tv_sec + (double) realtime.tv_nsec / 1.0e9;
++}

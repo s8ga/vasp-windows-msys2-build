@@ -1,0 +1,69 @@
+diff --git a/src/lib/dclock_.c b/src/lib/dclock_.c
+index 2da50cd..ac8af18 100644
+--- a/src/lib/dclock_.c
++++ b/src/lib/dclock_.c
+@@ -5,14 +5,42 @@
+       with BSD-compatibility timing routines ...)!?
+ *****************************************************************/
+ 
++#ifdef _WIN32
++#include <windows.h>
++static double win32_filetime_to_sec(const FILETIME *ft)
++{
++    ULARGE_INTEGER uli;
++    uli.LowPart  = ft->dwLowDateTime;
++    uli.HighPart = ft->dwHighDateTime;
++    return (double)uli.QuadPart / 1e7;   /* FILETIME counts 100ns ticks */
++}
++#else
+ #include <sys/resource.h>  // getrusage()
++#endif
+ #include <time.h>          // clock_gettime()
+ 
+ void vtime_C(double *vputim, double *cputim)
+ {
+-    struct rusage ppt, cpt;
+     struct timespec now;
+     int ierr;
++    (void)ierr;
++
++#ifdef _WIN32
++    /* Windows has no getrusage(); use GetProcessTimes for this process.
++       Child-process CPU time is not aggregated on Windows and is omitted. */
++    FILETIME _dummy_creat, _dummy_exit, ft_kernel, ft_user;
++    if (GetProcessTimes(GetCurrentProcess(), &_dummy_creat, &_dummy_exit,
++                        &ft_kernel, &ft_user))
++    {
++        *vputim = win32_filetime_to_sec(&ft_user)
++                + win32_filetime_to_sec(&ft_kernel);
++    }
++    else
++    {
++        *vputim = 0.0;
++    }
++#else
++    struct rusage ppt, cpt;
+ 
+     // Get process user and system time
+     ierr = getrusage(RUSAGE_SELF, &ppt);
+@@ -25,6 +53,7 @@ void vtime_C(double *vputim, double *cputim)
+     double tcs = (double)cpt.ru_stime.tv_sec + (double)cpt.ru_stime.tv_usec / 1e6;
+ 
+     *vputim = tpu + tps + tcu + tcs;
++#endif
+ 
+     ierr = clock_gettime(CLOCK_MONOTONIC, &now);
+     *cputim = (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+@@ -34,6 +63,7 @@ void vtime2_C(double *cputim)
+ {
+     struct timespec now;
+     int ierr = clock_gettime(CLOCK_MONOTONIC, &now);
++    (void)ierr;
+     *cputim = (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+ }
+ 
+@@ -48,4 +78,3 @@ long get_current_epoch()
+     }
+     return (long)current_time.tv_sec;
+ }
+-
