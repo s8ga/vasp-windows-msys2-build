@@ -24,17 +24,23 @@ fi
 command -v pacman >/dev/null 2>&1 || die "pacman not found; run inside MSYS2"
 
 log "installing UCRT64 build packages via pacman ..."
+# NOTE: Do NOT install mingw-w64-ucrt-x86_64-hdf5 — MSYS2 HDF5 pulls aws-c-*
+# (libaws*) into the portable ZIP. HDF5 is self-built via toolchain/scripts
+# (Wave 1+: install_hdf5.sh, ROS3 off). Keep zlib for that build.
 pacman -S --needed \
   mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-fortran \
   mingw-w64-ucrt-x86_64-binutils mingw-w64-ucrt-x86_64-cmake \
   mingw-w64-ucrt-x86_64-ninja \
   mingw-w64-ucrt-x86_64-msmpi \
   mingw-w64-ucrt-x86_64-openblas mingw-w64-ucrt-x86_64-scalapack \
-  mingw-w64-ucrt-x86_64-fftw mingw-w64-ucrt-x86_64-hdf5 \
-  mingw-w64-ucrt-x86_64-ntldd git tar zip
+  mingw-w64-ucrt-x86_64-fftw mingw-w64-ucrt-x86_64-zlib \
+  mingw-w64-ucrt-x86_64-ntldd git tar zip wget
 
 log "MSYS2 packages OK."
 cat <<'EOF'
+
+NOTE: Optional libs (HDF5 / LibXC / Wannier90 / DFTD4) are NOT from pacman.
+      Build them later with: bash toolchain/scripts/install_optional.sh
 
 Host Microsoft MPI (required so the pipeline can harvest mpiexec/smpd into the
 portable ZIP). Install once on Windows, e.g. in PowerShell:

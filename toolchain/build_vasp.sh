@@ -3,8 +3,12 @@
 # build_vasp.sh — thin wrapper: env + root build_pipeline.sh
 #
 # Usage (MSYS2 UCRT64 shell, from repo root or any cwd):
-#     bash toolchain/build_vasp.sh /c/path/to/vasp.6.6.0.tar.gz
-#     VASP_TARBALL=/c/path/to/vasp.6.6.0.tar.gz bash toolchain/build_vasp.sh
+#     bash toolchain/build_vasp.sh /c/path/to/vasp.6.6.0.tgz
+#     VASP_TARBALL=/c/path/to/vasp.6.6.0.tgz bash toolchain/build_vasp.sh
+#
+# VASP_TARBALL (env or $1) accepts MSYS (/c/...) or Windows (C:\... / C:/...)
+# paths; build_pipeline.sh normalizes them. Optional: source toolchain/local.env
+# via env_ucrt64.sh (see local.env.example).
 #
 # Single source of truth for the build remains ../build_pipeline.sh.
 # =============================================================================

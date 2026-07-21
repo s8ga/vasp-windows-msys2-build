@@ -5,13 +5,18 @@
 # One-command pipeline:  VASP tarball  -->  portable green ZIP artifact
 #
 # Run inside an MSYS2 *UCRT64* shell:
-#     VASP_TARBALL=/path/to/vasp.6.6.0.tar.gz bash build_pipeline.sh
+#     VASP_TARBALL=/c/path/to/vasp.6.6.0.tgz bash build_pipeline.sh
 # or
-#     bash build_pipeline.sh /path/to/vasp.6.6.0.tar.gz
+#     bash build_pipeline.sh /c/path/to/vasp.6.6.0.tgz
+#
+# VASP_TARBALL may be MSYS (/c/...) or Windows (C:\... / C:/...); preflight
+# normalizes via to_msys_path before the existence check.
 #
 # Co-located assets (relative to this script):
-#   ./vasp_cmake/   official CMake port (setup.sh, CMakeLists/, Find*.cmake)
-#   ./patches/      0001-dclock_*.patch 0002-timing_*.patch
+#   ./vasp_cmake/        official CMake port (setup.sh, CMakeLists/, Find*.cmake)
+#   ./patches/           0001/0002 timing + 0003 DFTD4 CMake enable
+#   ./cmake_overlays/    FindDFTD4.cmake / FindLibXC.cmake (copied into staged cmake/)
+#   ./toolchain/install/ self-built HDF5/LibXC/Wannier90/DFTD4 (via install/setup)
 #
 # Pipeline stages: preflight, unpack, setup, patch, configure, build, harvest,
 #                  package, zip
@@ -25,12 +30,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VASP_TARBALL="${VASP_TARBALL:-${1:-}}"
 VASP_CMAKE_DIR="${VASP_CMAKE_DIR:-${SCRIPT_DIR}/vasp_cmake}"
 PATCH_DIR="${PATCH_DIR:-${SCRIPT_DIR}/patches}"
+CMAKE_OVERLAY_DIR="${CMAKE_OVERLAY_DIR:-${SCRIPT_DIR}/cmake_overlays}"
+TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-${SCRIPT_DIR}/toolchain}"
 WORK_DIR="${WORK_DIR:-${SCRIPT_DIR}/build_work}"
 BUILD_DIR_NAME="${BUILD_DIR_NAME:-build}"
 PKG_NAME="${PKG_NAME:-vasp-6.6.0-msys2-portable}"
 MINGW_PREFIX="${MINGW_PREFIX:-/ucrt64}"
 TARGET_CPU="${TARGET_CPU:-x86-64}"
 BUILD_VARIANTS="${BUILD_VARIANTS:-vasp_std vasp_gam vasp_ncl}"
+# Optional features (ON/OFF). Disable individually if configure/link fails.
+VASP_HDF5="${VASP_HDF5:-ON}"
+VASP_LIBXC="${VASP_LIBXC:-ON}"
+VASP_WANNIER90="${VASP_WANNIER90:-ON}"
+VASP_DFTD4="${VASP_DFTD4:-ON}"
 # NUM_CORES — optional override for ninja -j (else RAM-capped nproc)
 
 #-----------------------------------------------------------------------------
@@ -82,6 +94,43 @@ resolve_mingw_prefix() {
   fi
 }
 
+# Source toolchain/install/setup so CMAKE_PREFIX_PATH lists self-built prefixes
+# before MINGW_PREFIX. Safe to call multiple times.
+source_toolchain_optional() {
+  local setup="${TOOLCHAIN_DIR}/install/setup"
+  local writer="${TOOLCHAIN_DIR}/scripts/write_aggregate_setup.sh"
+  if [ ! -f "${setup}" ] && [ -f "${writer}" ] && [ -d "${TOOLCHAIN_DIR}/install" ]; then
+    bash "${writer}" >/dev/null 2>&1 || true
+  fi
+  if [ -f "${setup}" ]; then
+    # shellcheck disable=SC1090
+    source "${setup}"
+    log "sourced ${setup}"
+  else
+    warn "toolchain/install/setup missing — optional libs may not be found"
+  fi
+  resolve_mingw_prefix
+  case ":${CMAKE_PREFIX_PATH:-}:" in
+    *":${MINGW_PREFIX}:"*) ;;
+    *) export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:+${CMAKE_PREFIX_PATH}:}${MINGW_PREFIX}" ;;
+  esac
+  # Realpath form of install root for DLL harvest matching
+  if [ -d "${TOOLCHAIN_DIR}/install" ]; then
+    TOOLCHAIN_INSTALL_REAL="$(cd "${TOOLCHAIN_DIR}/install" && pwd -P)"
+  else
+    TOOLCHAIN_INSTALL_REAL="${TOOLCHAIN_DIR}/install"
+  fi
+  export TOOLCHAIN_INSTALL_REAL
+  log "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}"
+  log "features: HDF5=${VASP_HDF5} LIBXC=${VASP_LIBXC} WANNIER90=${VASP_WANNIER90} DFTD4=${VASP_DFTD4}"
+}
+
+# CMake cache wants ';' separators; env uses ':' under MSYS.
+cmake_prefix_path_for_cmake() {
+  local p="${CMAKE_PREFIX_PATH:-${MINGW_PREFIX}}"
+  printf '%s' "${p//:/;}"
+}
+
 # Convert Windows / mixed paths to MSYS-style (/c/...) for prefix matching.
 to_msys_path() {
   local p="$1"
@@ -104,10 +153,11 @@ to_msys_path() {
   printf '%s' "$p"
 }
 
-# True if path is under MINGW_PREFIX (literal or real) or a Windows System32 dir.
+# True if path is under MINGW_PREFIX, toolchain/install, or a Windows System32 dir.
 is_harvestable_dll() {
   local dep="$1"
   local n rn parent
+  local tc="${TOOLCHAIN_INSTALL_REAL:-${TOOLCHAIN_DIR}/install}"
   n="$(to_msys_path "$dep")"
   if [ -e "$n" ]; then
     parent="$(cd "$(dirname "$n")" && pwd -P)"
@@ -117,10 +167,12 @@ is_harvestable_dll() {
   fi
   case "$n" in
     "${MINGW_PREFIX}"/*|"${MINGW_PREFIX_REAL}"/*) return 0 ;;
+    "${tc}"/*|"${TOOLCHAIN_DIR}/install"/*) return 0 ;;
     /[cC]/Windows/System32/*|/[cC]/WINDOWS/system32/*|/[cC]/Windows/system32/*|/[cC]/WINDOWS/System32/*) return 0 ;;
   esac
   case "$rn" in
     "${MINGW_PREFIX}"/*|"${MINGW_PREFIX_REAL}"/*) return 0 ;;
+    "${tc}"/*|"${TOOLCHAIN_DIR}/install"/*) return 0 ;;
     /[cC]/Windows/System32/*|/[cC]/WINDOWS/system32/*|/[cC]/Windows/system32/*|/[cC]/WINDOWS/System32/*) return 0 ;;
   esac
   return 1
@@ -140,6 +192,8 @@ preflight() {
   fi
 
   [ -n "${VASP_TARBALL}" ] || die "VASP_TARBALL not set. Usage: VASP_TARBALL=...tar.gz bash $0  (or pass as \$1)"
+  # Accept Windows (C:\... / C:/...) or MSYS (/c/...) forms.
+  VASP_TARBALL="$(to_msys_path "${VASP_TARBALL}")"
   [ -f "${VASP_TARBALL}" ] || die "tarball not found: ${VASP_TARBALL}"
   [ -d "${VASP_CMAKE_DIR}" ]           || die "vasp_cmake dir not found: ${VASP_CMAKE_DIR}"
   [ -f "${VASP_CMAKE_DIR}/setup.sh" ]  || die "setup.sh missing in ${VASP_CMAKE_DIR}"
@@ -152,6 +206,9 @@ preflight() {
 
   resolve_mingw_prefix
   log "MINGW_PREFIX=${MINGW_PREFIX} (real=${MINGW_PREFIX_REAL})"
+
+  # Self-built optional libs (CMAKE_PREFIX_PATH before MINGW_PREFIX)
+  source_toolchain_optional
 
   # key libraries present?
   local lib="${MINGW_PREFIX}/lib"
@@ -192,6 +249,31 @@ unpack() {
   rm -rf "${SRC_ROOT}/cmake"
   cp -a "${VASP_CMAKE_DIR}" "${SRC_ROOT}/cmake"
   log "staged vasp_cmake -> ${SRC_ROOT}/cmake"
+
+  # Overlays (FindDFTD4 / FindLibXC) into staged cmake/ — do not edit submodule.
+  if [ -d "${CMAKE_OVERLAY_DIR}" ]; then
+    local ov
+    for ov in "${CMAKE_OVERLAY_DIR}"/*.cmake; do
+      [ -f "${ov}" ] || continue
+      cp -f "${ov}" "${SRC_ROOT}/cmake/$(basename "${ov}")"
+      log "  overlay: $(basename "${ov}")"
+    done
+  fi
+
+  # Enable DFTD4 via staged CMakeLists_root.txt (before setup materializes root).
+  local p3="${PATCH_DIR}/0003-cmake-enable-dftd4.patch"
+  local root_lists="${SRC_ROOT}/cmake/CMakeLists/CMakeLists_root.txt"
+  if [ -f "${p3}" ] && [ -f "${root_lists}" ]; then
+    if grep -q 'find_package(DFTD4 MODULE REQUIRED)' "${root_lists}" 2>/dev/null; then
+      log "already patched: CMakeLists_root.txt (DFTD4)"
+    elif patch --dry-run --forward -p1 -d "${SRC_ROOT}" < "${p3}" >/dev/null 2>&1; then
+      patch --forward -p1 -d "${SRC_ROOT}" < "${p3}" && log "applied $(basename "${p3}")"
+    else
+      die "failed to apply $(basename "${p3}") to staged cmake/"
+    fi
+  else
+    warn "0003 DFTD4 patch or CMakeLists_root.txt missing; VASP_DFTD4 may fail"
+  fi
 }
 
 #-----------------------------------------------------------------------------
@@ -294,15 +376,23 @@ configure() {
   else
     inject_path="${MSMPI_WRAP_INJECT}"
   fi
+  # Re-apply optional env in case configure is invoked alone.
+  source_toolchain_optional
+  local cmake_prefix
+  cmake_prefix="$(cmake_prefix_path_for_cmake)"
   log "MS-MPI wrap symbols: ${wrap_syms_cm}"
   log "CMAKE_PROJECT_TOP_LEVEL_INCLUDES=${inject_path}"
+  log "CMAKE_PREFIX_PATH (cmake)=${cmake_prefix}"
   cmake -S "${SRC_ROOT}" -B "${BDIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_Fortran_COMPILER=gfortran \
     -DCMAKE_C_COMPILER=gcc \
-    -DCMAKE_PREFIX_PATH="${MINGW_PREFIX}" \
+    -DCMAKE_PREFIX_PATH="${cmake_prefix}" \
     -DVASP_OPENMP=ON \
-    -DVASP_HDF5=ON \
+    -DVASP_HDF5="${VASP_HDF5}" \
+    -DVASP_LIBXC="${VASP_LIBXC}" \
+    -DVASP_WANNIER90="${VASP_WANNIER90}" \
+    -DVASP_DFTD4="${VASP_DFTD4}" \
     -DVASP_SCALAPACK=ON \
     -DVASP_SHMEM=OFF \
     -DVASP_SYSV=OFF \
@@ -403,7 +493,15 @@ harvest() {
     fi
   done
 
-  log "harvested $(ls "${PKG_DIR}/bin" | wc -l) files"
+  # Hard gate: portable ZIP must never ship AWS/S3 HDF5 deps (libaws*).
+  local aws_hits
+  aws_hits="$(find "${PKG_DIR}" -iname 'libaws*' 2>/dev/null | head -20 || true)"
+  if [ -n "${aws_hits}" ]; then
+    printf '%s\n' "${aws_hits}" >&2
+    die "libaws* found under ${PKG_DIR} — refuse to package (use self-built HDF5 with ROS3 off)"
+  fi
+
+  log "harvested $(ls "${PKG_DIR}/bin" | wc -l) files (libaws check OK)"
 }
 
 #-----------------------------------------------------------------------------
@@ -490,10 +588,25 @@ package() {
   done
   [ "$unresolved" -eq 0 ] || die "ntldd reported missing MinGW/runtime DLLs — package is not self-contained"
 
-  ( cd "${WORK_DIR}" && zip -qr "${SCRIPT_DIR}/${PKG_NAME}.zip" "${PKG_NAME}" )
-  ( cd "${SCRIPT_DIR}" && sha256sum "${PKG_NAME}.zip" > "${PKG_NAME}.zip.sha256" )
-  log "artifact: ${SCRIPT_DIR}/${PKG_NAME}.zip"
-  cat "${SCRIPT_DIR}/${PKG_NAME}.zip.sha256"
+  # Write via temp name then replace — avoids "Device or resource busy" when an
+  # Explorer/antivirus handle still holds the previous *.zip.
+  local zip_out="${SCRIPT_DIR}/${PKG_NAME}.zip"
+  local zip_tmp="${SCRIPT_DIR}/${PKG_NAME}.zip.partial"
+  rm -f "${zip_tmp}"
+  ( cd "${WORK_DIR}" && zip -qr "${zip_tmp}" "${PKG_NAME}" ) || die "zip failed"
+  if rm -f "${zip_out}" 2>/dev/null && mv -f "${zip_tmp}" "${zip_out}"; then
+    :
+  else
+    # Destination locked: keep a usable alternate artifact and continue.
+    local zip_alt="${SCRIPT_DIR}/${PKG_NAME}-new.zip"
+    rm -f "${zip_alt}"
+    mv -f "${zip_tmp}" "${zip_alt}" || die "zip wrote but could not move ${zip_tmp}"
+    zip_out="${zip_alt}"
+    warn "could not replace ${PKG_NAME}.zip (locked); wrote ${zip_out}"
+  fi
+  ( cd "${SCRIPT_DIR}" && sha256sum "$(basename "${zip_out}")" > "${zip_out}.sha256" )
+  log "artifact: ${zip_out}"
+  cat "${zip_out}.sha256"
 }
 
 #-----------------------------------------------------------------------------

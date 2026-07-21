@@ -61,9 +61,10 @@ bash toolchain/install_deps_msys2.sh
 ```
 
 That installs the pacman packages (gcc/gfortran, cmake, ninja, msmpi,
-OpenBLAS, ScaLAPACK, FFTW, HDF5, ntldd, …). Separately, install **host**
-Microsoft MPI so the pipeline can harvest `mpiexec.exe` / `smpd.exe` /
-`msmpi.dll` into the portable package:
+OpenBLAS, ScaLAPACK, FFTW, zlib, ntldd, …). HDF5 is **not** from pacman
+(self-built later via `toolchain/scripts` to avoid `libaws*`). Separately,
+install **host** Microsoft MPI so the pipeline can harvest `mpiexec.exe` /
+`smpd.exe` / `msmpi.dll` into the portable package:
 
 ```powershell
 scoop install msmpi
@@ -88,22 +89,36 @@ files. They are gitignored on purpose.
 
 ### 2.4 Build via toolchain
 
-```bash
-bash toolchain/build_vasp.sh /c/path/to/vasp.6.6.0.tar.gz
-```
-
-Or:
+Point `VASP_TARBALL` at your licensed archive (MSYS `/c/...` or Windows
+`C:\...` / `C:/...` — both work; the pipeline normalizes before unpack):
 
 ```bash
-VASP_TARBALL=/c/path/to/vasp.6.6.0.tar.gz bash toolchain/build_vasp.sh
+# UCRT64 shell — MSYS path (recommended)
+export VASP_TARBALL='/c/Users/you/Downloads/vasp.6.6.0.tgz'
+bash toolchain/build_vasp.sh
 ```
+
+```powershell
+# PowerShell — set env, then open UCRT64 / run bash (path is normalized)
+$env:VASP_TARBALL='C:\Users\you\Downloads\vasp.6.6.0.tgz'
+```
+
+Or pass the path as `$1`:
+
+```bash
+bash toolchain/build_vasp.sh /c/path/to/vasp.6.6.0.tgz
+# same as: VASP_TARBALL=/c/path/to/vasp.6.6.0.tgz bash toolchain/build_vasp.sh
+```
+
+Optional convenience: copy `toolchain/local.env.example` → `toolchain/local.env`
+(gitignored) and set `VASP_TARBALL` there; `env_ucrt64.sh` sources it when present.
 
 `toolchain/build_vasp.sh` sources `toolchain/env_ucrt64.sh` (PATH /
 `MINGW_PREFIX` / `MSMPI_BIN`) then execs root **`build_pipeline.sh`**.
 You may still call the pipeline directly:
 
 ```bash
-bash build_pipeline.sh /c/path/to/vasp.6.6.0.tar.gz
+bash build_pipeline.sh /c/path/to/vasp.6.6.0.tgz
 ```
 
 Stages: `preflight → unpack → setup → patch → configure → build → harvest → package`.
@@ -114,7 +129,7 @@ Stages: `preflight → unpack → setup → patch → configure → build → ha
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `VASP_TARBALL` | `$1` | Path to the VASP source tarball |
+| `VASP_TARBALL` | `$1` | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
 | `TARGET_CPU` | `x86-64` | CPU baseline (`-march=`); use `native` for local speed |
 | `NUM_CORES` | *(unset)* | Override ninja `-j` (else RAM-capped `nproc`) |
 | `BUILD_VARIANTS` | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle |
