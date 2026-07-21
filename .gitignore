@@ -48,6 +48,7 @@ Desktop.ini
 # Local env / secrets
 .env
 .env.*
+toolchain/local.env
 *.pem
 *.key
 credentials*
@@ -56,4 +57,12 @@ secrets*
 # Local build logs
 *.log
 full_build_wrap.log
+
+# Optional-library toolchain prefixes and build trees (never commit)
+toolchain/install/
+toolchain/build/
+
+
+# Local smoke scratch (may contain POTCAR)
+smoke_wave2/
 
