@@ -3,6 +3,9 @@ build_work/
 **/build_work/
 vasp.*/
 
+# Licensed VASP testsuite (never commit). Overlays live in testsuite_overlays/.
+/testsuite/
+
 # Portable package outputs (ZIP + unpacked dirs)
 *.zip
 *.sha256

@@ -17,17 +17,22 @@ binaries.** You must provide your own licensed VASP tarball outside this repo.
 
 ## 1. What this is
 
-| Item | Role |
-|---|---|
-| `build_pipeline.sh` | **Single source of truth** — one-command driver (preflight → zip) |
-| `toolchain/` | Thin English entry points (deps / env / call pipeline) |
-| `patches/` | Win32 timing patches (`getrusage` → `GetProcessTimes`) |
-| `vasp_cmake/` | Official VASP CMake port (**git submodule**) |
+
+| Item                  | Role                                                               |
+| --------------------- | ------------------------------------------------------------------ |
+| `build_pipeline.sh`   | **Single source of truth** — one-command driver (preflight → zip)  |
+| `toolchain/`          | Thin English entry points (deps / env / call pipeline / testsuite) |
+| `testsuite_overlays/` | MS-MPI conf overlay copied into extracted VASP `testsuite/`        |
+| `patches/`            | Win32 timing patches (`getrusage` → `GetProcessTimes`)             |
+| `vasp_cmake/`         | Official VASP CMake port (**git submodule**)                       |
+
 
 Research notes and evidence from the original workspace are intentionally
 excluded. See [docs/DESIGN.md](docs/DESIGN.md) for a short design pointer.
 
 ---
+
+
 
 ## 2. Quick start: Clone → deps → build
 
@@ -73,7 +78,7 @@ scoop install msmpi
 ```
 
 or the official runtime (`msmpisetup.exe`) from
-<https://www.microsoft.com/download/details.aspx?id=100362>.
+[https://www.microsoft.com/download/details.aspx?id=100362](https://www.microsoft.com/download/details.aspx?id=100362).
 
 Optional override: `MSMPI_BIN=/c/path/to/Microsoft MPI/Bin`.
 
@@ -116,7 +121,7 @@ Optional convenience: copy `toolchain/local.env.example` → `toolchain/local.en
 (gitignored) and set `VASP_TARBALL` there; `env_ucrt64.sh` sources it when present.
 
 `toolchain/build_vasp.sh` sources `toolchain/env_ucrt64.sh` (PATH /
-`MINGW_PREFIX` / `MSMPI_BIN`) then execs root **`build_pipeline.sh`**.
+`MINGW_PREFIX` / `MSMPI_BIN`) then execs root `build_pipeline.sh`.
 You may still call the pipeline directly:
 
 ```bash
@@ -129,25 +134,29 @@ Stages: `preflight → unpack → setup → patch → configure → build → ha
 
 ### Tunables
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `VASP_TARBALL` | `$1` | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
-| `TARGET_CPU` | `x86-64` | CPU baseline (`-march=`); use `native` for local speed |
-| `NUM_CORES` | *(unset)* | Override ninja `-j` (else RAM-capped `nproc`) |
-| `BUILD_VARIANTS` | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle |
-| `PKG_NAME` | `vasp-6.6.0-msys2-portable` | Artifact name |
-| `MINGW_PREFIX` | `/ucrt64` | Resolved with `pwd -P` (Scoop symlinks OK) |
-| `ALLOW_NON_UCRT64` | *(unset)* | Set `1` to skip the UCRT64 hard gate |
-| `MSMPI_BIN` | *(auto)* | Directory containing host `mpiexec.exe` |
+
+| Variable           | Default                      | Purpose                                                             |
+| ------------------ | ---------------------------- | ------------------------------------------------------------------- |
+| `VASP_TARBALL`     | `$1`                         | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
+| `TARGET_CPU`       | `x86-64`                     | CPU baseline (`-march=`); use `native` for local speed              |
+| `NUM_CORES`        | *(unset)*                    | Override ninja `-j` (else RAM-capped `nproc`)                       |
+| `BUILD_VARIANTS`   | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle                                              |
+| `PKG_NAME`         | `vasp-6.6.0-msys2-portable`  | Artifact name                                                       |
+| `MINGW_PREFIX`     | `/ucrt64`                    | Resolved with `pwd -P` (Scoop symlinks OK)                          |
+| `ALLOW_NON_UCRT64` | *(unset)*                    | Set `1` to skip the UCRT64 hard gate                                |
+| `MSMPI_BIN`        | *(auto)*                     | Directory containing host `mpiexec.exe`                             |
+
 
 For a stage-by-stage walkthrough, see [STEP_BY_STEP.md](STEP_BY_STEP.md).
 
 ---
 
+
+
 ## 3. Portable ZIP usage
 
 Unzip anywhere. Place `INCAR`, `POSCAR`, `POTCAR`, `KPOINTS` next to `run.bat`,
-then double-click **`run.bat`** (4-rank MS-MPI by default):
+then double-click `run.bat` (4-rank MS-MPI by default):
 
 ```bat
 .\bin\mpiexec.exe -n 4 .\bin\vasp_std.exe
@@ -175,6 +184,40 @@ does not oversubscribe cores under MPI.
 
 ---
 
+
+
+## 3.1 Official VASP testsuite (optional)
+
+This repository does **not** ship the licensed `testsuite/` tree. After you
+unpack a VASP tarball (e.g. under `build_work/vasp.6.6.0/`), run the harness
+against the portable `bin/` with the MSYS2/MS-MPI overlay:
+
+```bash
+# UCRT64 — defaults: build_work/vasp.*/testsuite + build_work/vasp-*-msys2-portable/bin
+bash toolchain/run_testsuite.sh
+```
+
+Overrides:
+
+```bash
+export TESTSUITE_ROOT='/c/path/to/vasp.6.6.0/testsuite'
+export VASP_PORTABLE_BIN='/c/path/to/vasp-6.6.0-msys2-portable/bin'
+bash toolchain/run_testsuite.sh          # copies overlay + builds compare tool
+bash toolchain/run_testsuite.sh --fast   # same EXE_* via overlay, runtest --fast
+```
+
+What the runner does:
+
+1. Copies `testsuite_overlays/msys2_msmpi.conf` into `${TESTSUITE_ROOT}/`
+2. Builds `compare_numbertable_new` (gfortran) into `${TESTSUITE_ROOT}/tools/`
+3. Sets `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, and `PATH` for the
+   portable `bin/`
+4. Runs `./runtest msys2_msmpi.conf` (MS-MPI `mpiexec` + `vasp_{std,gam,ncl}.exe`)
+
+---
+
+
+
 ## 4. What we patch (and why)
 
 Only two **timing/reporting** C files get a Win32 branch
@@ -192,22 +235,28 @@ that defines missing `RTLD_NOLOAD` — no System-V shared memory.
 
 ---
 
+
+
 ## 5. Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| `find_package(MPI)` fails | Install `mingw-w64-ucrt-x86_64-msmpi`; pipeline passes `-DMPI_Fortran_*` |
-| `MSYSTEM=... must run in UCRT64` | Open **MSYS2 UCRT64**, or set `ALLOW_NON_UCRT64=1` only if you know why |
-| `setup.sh` / CMakeLists missing | Init the submodule: `git submodule update --init --recursive` |
-| Symlink / CMakeLists not found | Pipeline materializes symlink targets as real files for Windows CMake |
-| `cc1plus.exe: out of memory` | Lower parallelism: `NUM_CORES=2` |
-| `ntldd` shows `api-ms-*.dll` / `ext-ms-*.dll` not found | Harmless OS API-set stubs; packaging ignores them |
-| Real MinGW DLL `not found` | Check Scoop-resolved `MINGW_PREFIX`; re-run harvest or copy missing DLL into `bin/` |
-| OpenBLAS crash under MPI | Keep `OMP_NUM_THREADS=1` / `OPENBLAS_NUM_THREADS=1` in `run.bat` |
-| Missing `mpiexec.exe` in package | Install host MS-MPI (`scoop install msmpi` or official setup); set `MSMPI_BIN` if needed |
-| `mpiexec -n 2` crashes (MSYS2/MS-MPI); `-n 1` OK | **Fixed in current builds** via linker `--wrap` shim -- see [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md) and [docs/MSYS2_MSMPI_MULTIRANK.md](docs/MSYS2_MSMPI_MULTIRANK.md). Rebuild with current `build_pipeline.sh`. Older ZIPs without the shim: use `-n 1` or an Intel MPI package |
+
+| Symptom                                                 | Fix                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `find_package(MPI)` fails                               | Install `mingw-w64-ucrt-x86_64-msmpi`; pipeline passes `-DMPI_Fortran_*`                                                                                                                                                                                                                           |
+| `MSYSTEM=... must run in UCRT64`                        | Open **MSYS2 UCRT64**, or set `ALLOW_NON_UCRT64=1` only if you know why                                                                                                                                                                                                                            |
+| `setup.sh` / CMakeLists missing                         | Init the submodule: `git submodule update --init --recursive`                                                                                                                                                                                                                                      |
+| Symlink / CMakeLists not found                          | Pipeline materializes symlink targets as real files for Windows CMake                                                                                                                                                                                                                              |
+| `cc1plus.exe: out of memory`                            | Lower parallelism: `NUM_CORES=2`                                                                                                                                                                                                                                                                   |
+| `ntldd` shows `api-ms-*.dll` / `ext-ms-*.dll` not found | Harmless OS API-set stubs; packaging ignores them                                                                                                                                                                                                                                                  |
+| Real MinGW DLL `not found`                              | Check Scoop-resolved `MINGW_PREFIX`; re-run harvest or copy missing DLL into `bin/`                                                                                                                                                                                                                |
+| OpenBLAS crash under MPI                                | Keep `OMP_NUM_THREADS=1` / `OPENBLAS_NUM_THREADS=1` in `run.bat`                                                                                                                                                                                                                                   |
+| Missing `mpiexec.exe` in package                        | Install host MS-MPI (`scoop install msmpi` or official setup); set `MSMPI_BIN` if needed                                                                                                                                                                                                           |
+| `mpiexec -n 2` crashes (MSYS2/MS-MPI); `-n 1` OK        | **Fixed in current builds** via linker `--wrap` shim -- see [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md) and [docs/MSYS2_MSMPI_MULTIRANK.md](docs/MSYS2_MSMPI_MULTIRANK.md). Rebuild with current `build_pipeline.sh`. Older ZIPs without the shim: use `-n 1` or an Intel MPI package |
+
 
 ---
+
+
 
 ## License reminder
 
