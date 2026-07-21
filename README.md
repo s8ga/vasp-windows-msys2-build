@@ -193,7 +193,7 @@ unpack a VASP tarball (e.g. under `build_work/vasp.6.6.0/`), run the harness
 against the portable `bin/` with the MSYS2/MS-MPI overlay:
 
 ```bash
-# UCRT64 — defaults: build_work/vasp.*/testsuite + build_work/vasp-*-msys2-portable/bin
+# UCRT64 - defaults: build_work/vasp.*/testsuite + build_work/vasp-*-msys2-portable/bin
 bash toolchain/run_testsuite.sh
 ```
 
