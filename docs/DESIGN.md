@@ -18,7 +18,9 @@ here.
 
 1. Stage official CMake lists into the unpacked VASP tree; materialize
    `CMakeLists.txt` symlinks as real files so Windows CMake can read them.
-2. Apply only Win32 timing patches (`getrusage` → `GetProcessTimes`).
+2. Apply Win32 patches: timing (`getrusage` → `GetProcessTimes`) and MAXMEM
+   auto-detect (`/proc/meminfo` → `GlobalMemoryStatusEx`; see
+   [WIN32_MAXMEM.md](WIN32_MAXMEM.md)).
 3. Configure with OpenBLAS + MS-MPI + ScaLAPACK + FFTW + HDF5; disable SysV/SHMEM.
 4. Harvest runtime DLLs using real MinGW paths (Scoop symlink-aware) and host
    MS-MPI launcher files.

@@ -2,24 +2,30 @@
 # =============================================================================
 # build_pipeline.sh — VASP 6.6.x Windows-native build (MSYS2 UCRT64, C2 route)
 #
-# One-command pipeline:  VASP tarball  -->  portable green ZIP artifact
+# Modes (VASP_PIPELINE_MODE):
+#   release (default) — full pipeline: tarball --> portable green ZIP
+#   develop           — reuse existing build_work, stop after build
+#                       (no unpack wipe, no harvest/package/zip)
 #
 # Run inside an MSYS2 *UCRT64* shell:
 #     VASP_TARBALL=/c/path/to/vasp.6.6.0.tgz bash build_pipeline.sh
-# or
 #     bash build_pipeline.sh /c/path/to/vasp.6.6.0.tgz
+#     VASP_PIPELINE_MODE=develop VASP_TARBALL=... bash build_pipeline.sh
+#     bash build_pipeline.sh --develop /c/path/to/vasp.6.6.0.tgz
 #
 # VASP_TARBALL may be MSYS (/c/...) or Windows (C:\... / C:/...); preflight
 # normalizes via to_msys_path before the existence check.
 #
 # Co-located assets (relative to this script):
 #   ./vasp_cmake/        official CMake port (setup.sh, CMakeLists/, Find*.cmake)
-#   ./patches/           0001/0002 timing + 0003 DFTD4 CMake enable
+#   ./patches/           0001/0002 timing + 0003 DFTD4 + 0004 Win32 MAXMEM
+#   ./shim/              MS-MPI wrap, FFTW, Win32 available-memory helper
 #   ./cmake_overlays/    FindDFTD4.cmake / FindLibXC.cmake (copied into staged cmake/)
 #   ./toolchain/install/ self-built HDF5/LibXC/Wannier90/DFTD4 (via install/setup)
 #
-# Pipeline stages: preflight, unpack, setup, patch, configure, build, harvest,
-#                  package, zip
+# release stages: preflight, unpack, setup, patch, configure, build, harvest,
+#                 package, zip
+# develop stages: preflight, locate tree, patch, (configure if needed), build
 # =============================================================================
 set -euo pipefail
 
@@ -27,7 +33,8 @@ set -euo pipefail
 # Configuration (override via environment)
 #-----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VASP_TARBALL="${VASP_TARBALL:-${1:-}}"
+VASP_PIPELINE_MODE="${VASP_PIPELINE_MODE:-release}"
+VASP_TARBALL="${VASP_TARBALL:-}"
 VASP_CMAKE_DIR="${VASP_CMAKE_DIR:-${SCRIPT_DIR}/vasp_cmake}"
 PATCH_DIR="${PATCH_DIR:-${SCRIPT_DIR}/patches}"
 CMAKE_OVERLAY_DIR="${CMAKE_OVERLAY_DIR:-${SCRIPT_DIR}/cmake_overlays}"
@@ -38,11 +45,21 @@ PKG_NAME="${PKG_NAME:-vasp-6.6.0-msys2-portable}"
 MINGW_PREFIX="${MINGW_PREFIX:-/ucrt64}"
 TARGET_CPU="${TARGET_CPU:-x86-64}"
 BUILD_VARIANTS="${BUILD_VARIANTS:-vasp_std vasp_gam vasp_ncl}"
+# CMake build type (Release default). Use RelWithDebInfo for gdb file:line stacks.
+CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 # Optional features (ON/OFF). Disable individually if configure/link fails.
 VASP_HDF5="${VASP_HDF5:-ON}"
 VASP_LIBXC="${VASP_LIBXC:-ON}"
 VASP_WANNIER90="${VASP_WANNIER90:-ON}"
 VASP_DFTD4="${VASP_DFTD4:-ON}"
+# fftlib (dynamic FFTW). OFF = classic FFT path; useful for PBE0/SIGSEGV A/B.
+VASP_FFTLIB="${VASP_FFTLIB:-ON}"
+# OpenMP (ON default). OFF = diagnostic: no GOMP CRITICAL in fftbas_plan path.
+VASP_OPENMP="${VASP_OPENMP:-ON}"
+# Experimental diagnostic only: replace VASP's named FFT planner CRITICAL
+# with a native Win32 SRW lock. Default OFF: the mpi_waitall_ /MPIPRIV2/
+# sentinel fix prevents the BSS corruption that previously damaged this lock.
+VASP_GOMP_CRITICAL_WIN32="${VASP_GOMP_CRITICAL_WIN32:-OFF}"
 # NUM_CORES — optional override for ninja -j (else RAM-capped nproc)
 
 #-----------------------------------------------------------------------------
@@ -51,6 +68,50 @@ VASP_DFTD4="${VASP_DFTD4:-ON}"
 log()  { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n'  "$*" >&2; }
 die()  { printf '\033[1;31m[err ]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Parse CLI: --develop / --help and optional tarball positional.
+parse_args() {
+  local arg
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    case "${arg}" in
+      --develop)
+        VASP_PIPELINE_MODE=develop
+        shift
+        ;;
+      --help|-h)
+        cat <<'EOF'
+Usage:
+  VASP_TARBALL=/c/path/to/vasp.tgz bash build_pipeline.sh
+  bash build_pipeline.sh /c/path/to/vasp.tgz
+  VASP_PIPELINE_MODE=develop VASP_TARBALL=... bash build_pipeline.sh
+  bash build_pipeline.sh --develop /c/path/to/vasp.tgz
+
+Modes (VASP_PIPELINE_MODE):
+  release  full pipeline through portable ZIP (default)
+  develop  reuse build_work; rebuild only; skip harvest/package/zip
+           (never rm -rf build_work; requires a prior release unpack)
+EOF
+        exit 0
+        ;;
+      --*)
+        die "unknown option: ${arg} (try --help)"
+        ;;
+      *)
+        if [ -z "${VASP_TARBALL}" ]; then
+          VASP_TARBALL="${arg}"
+        else
+          die "unexpected argument: ${arg}"
+        fi
+        shift
+        ;;
+    esac
+  done
+  case "${VASP_PIPELINE_MODE}" in
+    release|develop) ;;
+    *) die "invalid VASP_PIPELINE_MODE='${VASP_PIPELINE_MODE}' (use release or develop)" ;;
+  esac
+}
 
 stage() { # stage <n> <name>
   log "[$1] $2"
@@ -122,7 +183,7 @@ source_toolchain_optional() {
   fi
   export TOOLCHAIN_INSTALL_REAL
   log "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}"
-  log "features: HDF5=${VASP_HDF5} LIBXC=${VASP_LIBXC} WANNIER90=${VASP_WANNIER90} DFTD4=${VASP_DFTD4}"
+  log "features: HDF5=${VASP_HDF5} LIBXC=${VASP_LIBXC} WANNIER90=${VASP_WANNIER90} DFTD4=${VASP_DFTD4} OPENMP=${VASP_OPENMP}"
 }
 
 # CMake cache wants ';' separators; env uses ':' under MSYS.
@@ -183,6 +244,10 @@ is_harvestable_dll() {
 #-----------------------------------------------------------------------------
 preflight() {
   stage 0 "preflight"
+  case "${VASP_GOMP_CRITICAL_WIN32}" in
+    ON|OFF) ;;
+    *) die "VASP_GOMP_CRITICAL_WIN32 must be ON or OFF" ;;
+  esac
   if [ "${MSYSTEM:-}" != "UCRT64" ]; then
     if [ "${ALLOW_NON_UCRT64:-}" = "1" ]; then
       warn "MSYSTEM=${MSYSTEM:-unset} (expected UCRT64); continuing due to ALLOW_NON_UCRT64=1"
@@ -199,13 +264,25 @@ preflight() {
   [ -f "${VASP_CMAKE_DIR}/setup.sh" ]  || die "setup.sh missing in ${VASP_CMAKE_DIR}"
   [ -d "${PATCH_DIR}" ] || die "patches dir not found: ${PATCH_DIR}"
 
-  local need=(gfortran gcc cmake ninja ntldd zip patch sha256sum)
+  local need=(gfortran gcc cmake ninja patch)
+  local soft=(ntldd zip sha256sum)
+  local t
   for t in "${need[@]}"; do
     command -v "$t" >/dev/null 2>&1 || die "missing tool '$t' (pacman -S mingw-w64-ucrt-x86_64-... / msys tools)"
+  done
+  for t in "${soft[@]}"; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      if [ "${VASP_PIPELINE_MODE}" = "develop" ]; then
+        warn "missing tool '$t' (ok for develop; needed for release harvest/zip)"
+      else
+        die "missing tool '$t' (pacman -S mingw-w64-ucrt-x86_64-... / msys tools)"
+      fi
+    fi
   done
 
   resolve_mingw_prefix
   log "MINGW_PREFIX=${MINGW_PREFIX} (real=${MINGW_PREFIX_REAL})"
+  log "VASP_PIPELINE_MODE=${VASP_PIPELINE_MODE}"
 
   # Self-built optional libs (CMAKE_PREFIX_PATH before MINGW_PREFIX)
   source_toolchain_optional
@@ -215,11 +292,91 @@ preflight() {
   [ -f "${lib}/libmsmpi.dll.a" ]    || warn "libmsmpi.dll.a not in ${lib} (msmpi pkg?)"
   ls "${lib}"/libopenblas*.dll.a >/dev/null 2>&1 || warn "OpenBLAS import lib not in ${lib}"
   # fftlib (VASP_FFTLIB=ON) needs POSIX dlopen; MinGW provides it via dlfcn-win32.
-  [ -f "${MINGW_PREFIX}/include/dlfcn.h" ] \
-    || die "missing dlfcn.h (pacman -S mingw-w64-ucrt-x86_64-dlfcn) — required for VASP_FFTLIB"
-
+  if [ "${VASP_FFTLIB}" = "ON" ]; then
+    [ -f "${MINGW_PREFIX}/include/dlfcn.h" ] \
+      || die "missing dlfcn.h (pacman -S mingw-w64-ucrt-x86_64-dlfcn) — required for VASP_FFTLIB=ON"
+  fi
+  log "VASP_FFTLIB=${VASP_FFTLIB}"
+  log "VASP_GOMP_CRITICAL_WIN32=${VASP_GOMP_CRITICAL_WIN32}"
   log "toolchain OK (gfortran=$(gfortran -dumpversion), cmake=$(cmake --version | head -1 | awk '{print $3}'))"
   log "tarball: ${VASP_TARBALL}"
+}
+
+#-----------------------------------------------------------------------------
+# locate_existing_tree — develop mode: find SRC_ROOT/BDIR without wiping WORK_DIR
+#-----------------------------------------------------------------------------
+locate_existing_tree() {
+  stage 1 "locate existing tree (develop; no unpack)"
+  [ -d "${WORK_DIR}" ] || die "WORK_DIR missing: ${WORK_DIR} — run a full release build once first"
+  SRC_ROOT="$(find "${WORK_DIR}" -maxdepth 2 -type d -name src -printf '%h\n' 2>/dev/null | head -1)"
+  [ -n "${SRC_ROOT}" ] || die "no src/ under ${WORK_DIR} — run a full release build once first"
+  [ -d "${SRC_ROOT}/src" ] || die "invalid SRC_ROOT: ${SRC_ROOT}"
+  BDIR="${SRC_ROOT}/${BUILD_DIR_NAME}"
+  log "source root: ${SRC_ROOT}"
+  log "build dir:   ${BDIR}"
+}
+
+# develop: recompile wrap/planner objects; reconfigure in-place if cache exists
+# (does not rm -rf BDIR). Re-pass TOP_LEVEL_INCLUDES so fftlib FFTW remap applies.
+develop_prepare() {
+  locate_existing_tree
+  # Idempotent: apply any new patches (e.g. 0004 MAXMEM) on existing tree
+  patch_sources
+  if [ ! -f "${BDIR}/CMakeCache.txt" ]; then
+    warn "no CMake cache at ${BDIR}; running full configure (does not wipe WORK_DIR)"
+    # configure() historically rm -rf BDIR — safe here because cache is absent.
+    configure
+  else
+    stage 4 "reuse configure cache (develop; re-apply injects)"
+    mkdir -p "${BDIR}"
+    compile_msmpi_wrap "${BDIR}"
+    local wrap_syms_cm; wrap_syms_cm="$(msmpi_wrap_syms_cmake)"
+    local inject_msmpi inject_fftlib inject_mem inject_gomp inject_path
+    if command -v cygpath >/dev/null 2>&1; then
+      inject_msmpi="$(cygpath -m "${MSMPI_WRAP_INJECT}")"
+      inject_fftlib="$(cygpath -m "${FFTLIB_WIN32_INJECT}")"
+      inject_mem="$(cygpath -m "${WIN32_MEM_INJECT}")"
+      inject_gomp="$(cygpath -m "${GOMP_CRITICAL_WIN32_INJECT}")"
+    else
+      inject_msmpi="${MSMPI_WRAP_INJECT}"
+      inject_fftlib="${FFTLIB_WIN32_INJECT}"
+      inject_mem="${WIN32_MEM_INJECT}"
+      inject_gomp="${GOMP_CRITICAL_WIN32_INJECT}"
+    fi
+    inject_path="${inject_msmpi};${inject_fftlib};${inject_mem};${inject_gomp}"
+    log "CMAKE_PROJECT_TOP_LEVEL_INCLUDES=${inject_path}"
+    log "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+    log "VASP_OPENMP=${VASP_OPENMP} VASP_DFTD4=${VASP_DFTD4} VASP_FFTLIB=${VASP_FFTLIB}"
+    # Re-run configure against existing tree so FFTW OMP->threads remap refreshes link lines.
+    # Pass the same feature/BLAS knobs as configure() so develop A/B toggles do not
+    # drop OpenBLAS / MPI link lines.
+    cmake -S "${SRC_ROOT}" -B "${BDIR}" \
+      -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+      -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${inject_path}" \
+      -DVASP_MSMPI_WRAP_OBJ="${MSMPI_WRAP_OBJ}" \
+      -DVASP_MSMPI_WRAP_SYMS="${wrap_syms_cm}" \
+      -DVASP_FFTW_PLANNER_SAFE_OBJ="${FFTW_PLANNER_SAFE_OBJ}" \
+      -DVASP_WIN32_MEM_OBJ="${WIN32_MEM_OBJ}" \
+      -DVASP_GOMP_CRITICAL_WIN32_OBJ="${GOMP_CRITICAL_WIN32_OBJ}" \
+      -DVASP_OPENMP="${VASP_OPENMP}" \
+      -DVASP_FFTLIB="${VASP_FFTLIB}" \
+      -DVASP_HDF5="${VASP_HDF5}" \
+      -DVASP_LIBXC="${VASP_LIBXC}" \
+      -DVASP_WANNIER90="${VASP_WANNIER90}" \
+      -DVASP_DFTD4="${VASP_DFTD4}" \
+      -DBLA_VENDOR=OpenBLAS \
+      -DLAPACK_DIR="${MINGW_PREFIX}/lib" \
+      -DFFTW_ROOT="${MINGW_PREFIX}" \
+      -DMPI_Fortran_INCLUDE_PATH="${MINGW_PREFIX}/include" \
+      -DMPI_Fortran_LIBRARIES="${MINGW_PREFIX}/lib/libmsmpi.dll.a"
+    log "wrap object ready: ${MSMPI_WRAP_OBJ}"
+    log "FFTW planner-safe object: ${FFTW_PLANNER_SAFE_OBJ}"
+    log "Win32 MAXMEM object: ${WIN32_MEM_OBJ}"
+    log "GOMP FFT planner lock object: ${GOMP_CRITICAL_WIN32_OBJ:-disabled}"
+    log "VASP_OPENMP=${VASP_OPENMP}"
+    log "VASP_FFTLIB=${VASP_FFTLIB}"
+    log "VASP_DFTD4=${VASP_DFTD4}"
+  fi
 }
 
 #-----------------------------------------------------------------------------
@@ -299,20 +456,23 @@ setup() {
 }
 
 #-----------------------------------------------------------------------------
-# [3] patch — apply Win32 timing patches (idempotent)
+# [3] patch — apply Win32 timing + MAXMEM patches (idempotent)
 #-----------------------------------------------------------------------------
 patch_sources() {
-  stage 3 "patch (dclock_.c / timing_.c Win32)"
+  stage 3 "patch (dclock_/timing_ Win32 + AUTOSET MAXMEM)"
   # explicit file -> patch mapping (robust; no name guessing)
+  # marker: substring already present => skip (idempotent)
   local entries=(
-    "src/lib/dclock_.c|${PATCH_DIR}/0001-dclock_-win32-getrusage.patch"
-    "src/lib/timing_.c|${PATCH_DIR}/0002-timing_-win32-getrusage.patch"
+    "src/lib/dclock_.c|${PATCH_DIR}/0001-dclock_-win32-getrusage.patch|win32_filetime_to_sec"
+    "src/lib/timing_.c|${PATCH_DIR}/0002-timing_-win32-getrusage.patch|win32_filetime_to_sec"
+    "src/ini.F|${PATCH_DIR}/0004-autoset-available-memory-win32.patch|vasp_win32_available_memory_kb"
   )
-  local entry f p
+  local entry f p marker rest
   for entry in "${entries[@]}"; do
-    f="${entry%%|*}"; p="${entry#*|}"
+    f="${entry%%|*}"; rest="${entry#*|}"
+    p="${rest%%|*}"; marker="${rest#*|}"
     [ -f "$p" ] || { warn "patch missing: $p"; continue; }
-    if grep -q "win32_filetime_to_sec" "${SRC_ROOT}/${f}" 2>/dev/null; then
+    if grep -q "${marker}" "${SRC_ROOT}/${f}" 2>/dev/null; then
       log "already patched: $f"; continue
     fi
     if patch --dry-run --forward -p1 -d "${SRC_ROOT}" < "$p" >/dev/null 2>&1; then
@@ -323,6 +483,7 @@ patch_sources() {
   done
   grep -q "win32_filetime_to_sec" "${SRC_ROOT}/src/lib/dclock_.c" || die "dclock_.c patch not active"
   grep -q "win32_filetime_to_sec" "${SRC_ROOT}/src/lib/timing_.c" || die "timing_.c patch not active"
+  grep -q "vasp_win32_available_memory_kb" "${SRC_ROOT}/src/ini.F" || die "ini.F Win32 MAXMEM patch not active"
 }
 
 #-----------------------------------------------------------------------------
@@ -336,8 +497,15 @@ patch_sources() {
 MSMPI_WRAP_SRC="${MSMPI_WRAP_SRC:-${SCRIPT_DIR}/shim/msmpi_inplace_wrap.c}"
 MSMPI_WRAP_INJECT="${MSMPI_WRAP_INJECT:-${SCRIPT_DIR}/shim/cmake_msmpi_wrap_inject.cmake}"
 FFTLIB_WIN32_INJECT="${FFTLIB_WIN32_INJECT:-${SCRIPT_DIR}/shim/cmake_fftlib_win32_inject.cmake}"
+FFTW_PLANNER_SAFE_SRC="${FFTW_PLANNER_SAFE_SRC:-${SCRIPT_DIR}/shim/fftw_planner_thread_safe.c}"
+WIN32_MEM_SRC="${WIN32_MEM_SRC:-${SCRIPT_DIR}/shim/win32_available_memory.c}"
+WIN32_MEM_INJECT="${WIN32_MEM_INJECT:-${SCRIPT_DIR}/shim/cmake_win32_mem_inject.cmake}"
+GOMP_CRITICAL_WIN32_SRC="${GOMP_CRITICAL_WIN32_SRC:-${SCRIPT_DIR}/shim/gomp_critical_win32.c}"
+GOMP_CRITICAL_WIN32_INJECT="${GOMP_CRITICAL_WIN32_INJECT:-${SCRIPT_DIR}/shim/cmake_gomp_critical_win32_inject.cmake}"
 # Symbols discovered via nm on vasp_std (collectives / RMA that may see IN_PLACE or BOTTOM)
-MSMPI_WRAP_SYMS="${MSMPI_WRAP_SYMS:-mpi_allreduce_ mpi_reduce_ mpi_allgather_ mpi_allgatherv_ mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_get_}"
+# Also wrap BLACS grid init to set TopsRepeat (avoid BLACS C MPI_Allreduce
+# DATATYPE_NULL on MS-MPI; see docs/MSMPI_INPLACE_SHIM.md).
+MSMPI_WRAP_SYMS="${MSMPI_WRAP_SYMS:-mpi_allreduce_ mpi_reduce_ mpi_allgather_ mpi_allgatherv_ mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_waitall_ mpi_get_ blacs_gridinit_ blacs_gridmap_}"
 
 msmpi_wrap_syms_cmake() { # semicolon-separated list for CMake cache
   local s out=""
@@ -347,21 +515,53 @@ msmpi_wrap_syms_cmake() { # semicolon-separated list for CMake cache
   printf '%s' "${out}"
 }
 
-compile_msmpi_wrap() { # compile_msmpi_wrap <outdir> -> sets MSMPI_WRAP_OBJ (mixed path)
+# to_mixed_path <unix-path> — Ninja/cmd.exe prefers Windows mixed paths
+to_mixed_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+compile_msmpi_wrap() { # compile_msmpi_wrap <outdir> -> sets MSMPI_WRAP_OBJ (+ FFTW + Win32 mem objs)
   local outdir="$1"
   mkdir -p "${outdir}"
   local obj_unix="${outdir}/msmpi_inplace_wrap.o"
+  local fftw_obj_unix="${outdir}/fftw_planner_thread_safe.o"
+  local mem_obj_unix="${outdir}/win32_available_memory.o"
+  local gomp_obj_unix="${outdir}/gomp_critical_win32.o"
   [ -f "${MSMPI_WRAP_SRC}" ] || die "missing MS-MPI wrap shim: ${MSMPI_WRAP_SRC}"
   [ -f "${MSMPI_WRAP_INJECT}" ] || die "missing MS-MPI wrap CMake inject: ${MSMPI_WRAP_INJECT}"
   [ -f "${FFTLIB_WIN32_INJECT}" ] || die "missing fftlib win32 CMake inject: ${FFTLIB_WIN32_INJECT}"
+  [ -f "${FFTW_PLANNER_SAFE_SRC}" ] || die "missing FFTW planner-safe shim: ${FFTW_PLANNER_SAFE_SRC}"
+  [ -f "${WIN32_MEM_SRC}" ] || die "missing Win32 MAXMEM shim: ${WIN32_MEM_SRC}"
+  [ -f "${WIN32_MEM_INJECT}" ] || die "missing Win32 MAXMEM CMake inject: ${WIN32_MEM_INJECT}"
+  [ -f "${GOMP_CRITICAL_WIN32_SRC}" ] || die "missing GOMP Win32 lock shim: ${GOMP_CRITICAL_WIN32_SRC}"
+  [ -f "${GOMP_CRITICAL_WIN32_INJECT}" ] || die "missing GOMP Win32 lock CMake inject: ${GOMP_CRITICAL_WIN32_INJECT}"
   gcc -c "${MSMPI_WRAP_SRC}" -I"${MINGW_PREFIX}/include" -o "${obj_unix}"
-  # Ninja/cmd.exe linker prefers Windows mixed paths over /c/...
-  if command -v cygpath >/dev/null 2>&1; then
-    MSMPI_WRAP_OBJ="$(cygpath -m "${obj_unix}")"
+  # Planner-safe ctor needs libfftw3_threads; skip when VASP_OPENMP=OFF.
+  if [ "${VASP_OPENMP}" != "OFF" ]; then
+    gcc -c "${FFTW_PLANNER_SAFE_SRC}" -I"${MINGW_PREFIX}/include" -o "${fftw_obj_unix}"
+    FFTW_PLANNER_SAFE_OBJ="$(to_mixed_path "${fftw_obj_unix}")"
+    log "compiled FFTW planner-safe ctor: ${FFTW_PLANNER_SAFE_OBJ}"
   else
-    MSMPI_WRAP_OBJ="${obj_unix}"
+    FFTW_PLANNER_SAFE_OBJ=""
+    log "skipped FFTW planner-safe ctor (VASP_OPENMP=OFF)"
   fi
+  gcc -c "${WIN32_MEM_SRC}" -o "${mem_obj_unix}"
+  if [ "${VASP_OPENMP}" = "ON" ] && [ "${VASP_GOMP_CRITICAL_WIN32}" = "ON" ]; then
+    gcc -c "${GOMP_CRITICAL_WIN32_SRC}" -o "${gomp_obj_unix}"
+    GOMP_CRITICAL_WIN32_OBJ="$(to_mixed_path "${gomp_obj_unix}")"
+    log "compiled GOMP FFT planner Win32 lock: ${GOMP_CRITICAL_WIN32_OBJ}"
+  else
+    GOMP_CRITICAL_WIN32_OBJ=""
+    log "skipped GOMP FFT planner Win32 lock"
+  fi
+  MSMPI_WRAP_OBJ="$(to_mixed_path "${obj_unix}")"
+  WIN32_MEM_OBJ="$(to_mixed_path "${mem_obj_unix}")"
   log "compiled MS-MPI IN_PLACE wrap: ${MSMPI_WRAP_OBJ}"
+  log "compiled Win32 available-memory helper: ${WIN32_MEM_OBJ}"
 }
 
 #-----------------------------------------------------------------------------
@@ -375,16 +575,20 @@ configure() {
   local jobs; jobs="$(compute_jobs)"
   compile_msmpi_wrap "${BDIR}"
   local wrap_syms_cm; wrap_syms_cm="$(msmpi_wrap_syms_cmake)"
-  local inject_msmpi inject_fftlib inject_path
+  local inject_msmpi inject_fftlib inject_mem inject_gomp inject_path
   if command -v cygpath >/dev/null 2>&1; then
     inject_msmpi="$(cygpath -m "${MSMPI_WRAP_INJECT}")"
     inject_fftlib="$(cygpath -m "${FFTLIB_WIN32_INJECT}")"
+    inject_mem="$(cygpath -m "${WIN32_MEM_INJECT}")"
+    inject_gomp="$(cygpath -m "${GOMP_CRITICAL_WIN32_INJECT}")"
   else
     inject_msmpi="${MSMPI_WRAP_INJECT}"
     inject_fftlib="${FFTLIB_WIN32_INJECT}"
+    inject_mem="${WIN32_MEM_INJECT}"
+    inject_gomp="${GOMP_CRITICAL_WIN32_INJECT}"
   fi
-  # Semicolon list: MS-MPI wrap + fftlib MinGW dlfcn RTLD_NOLOAD shim
-  inject_path="${inject_msmpi};${inject_fftlib}"
+  # Semicolon list: MS-MPI wrap + fftlib + MAXMEM + GOMP named-critical helper
+  inject_path="${inject_msmpi};${inject_fftlib};${inject_mem};${inject_gomp}"
   # Re-apply optional env in case configure is invoked alone.
   source_toolchain_optional
   local cmake_prefix
@@ -392,13 +596,15 @@ configure() {
   log "MS-MPI wrap symbols: ${wrap_syms_cm}"
   log "CMAKE_PROJECT_TOP_LEVEL_INCLUDES=${inject_path}"
   log "CMAKE_PREFIX_PATH (cmake)=${cmake_prefix}"
+  log "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+  log "VASP_OPENMP=${VASP_OPENMP}"
   cmake -S "${SRC_ROOT}" -B "${BDIR}" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
     -DCMAKE_Fortran_COMPILER=gfortran \
     -DCMAKE_C_COMPILER=gcc \
     -DCMAKE_PREFIX_PATH="${cmake_prefix}" \
-    -DVASP_OPENMP=ON \
-    -DVASP_FFTLIB=ON \
+    -DVASP_OPENMP="${VASP_OPENMP}" \
+    -DVASP_FFTLIB="${VASP_FFTLIB}" \
     -DVASP_HDF5="${VASP_HDF5}" \
     -DVASP_LIBXC="${VASP_LIBXC}" \
     -DVASP_WANNIER90="${VASP_WANNIER90}" \
@@ -411,6 +617,9 @@ configure() {
     -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${inject_path}" \
     -DVASP_MSMPI_WRAP_OBJ="${MSMPI_WRAP_OBJ}" \
     -DVASP_MSMPI_WRAP_SYMS="${wrap_syms_cm}" \
+    -DVASP_FFTW_PLANNER_SAFE_OBJ="${FFTW_PLANNER_SAFE_OBJ}" \
+    -DVASP_WIN32_MEM_OBJ="${WIN32_MEM_OBJ}" \
+    -DVASP_GOMP_CRITICAL_WIN32_OBJ="${GOMP_CRITICAL_WIN32_OBJ}" \
     -DBLA_VENDOR=OpenBLAS \
     -DLAPACK_DIR="${MINGW_PREFIX}/lib" \
     -DFFTW_ROOT="${MINGW_PREFIX}" \
@@ -503,6 +712,21 @@ harvest() {
     fi
   done
 
+  # FFTW: ship pthread backend only. Upstream fftlib may dlopen libfftw3_omp*;
+  # a real omp DLL pulls libgomp into planning. Exe is remapped to
+  # libfftw3_threads via shim/cmake_fftlib_win32_inject.cmake.
+  local threads_dll="${MINGW_PREFIX}/bin/libfftw3_threads-3.dll"
+  if [ -f "${threads_dll}" ]; then
+    cp -f "${threads_dll}" "${PKG_DIR}/bin/libfftw3_threads-3.dll"
+    log "  + libfftw3_threads-3.dll (FFTW pthread backend)"
+  else
+    warn "libfftw3_threads-3.dll not found under ${MINGW_PREFIX}/bin"
+  fi
+  if [ -f "${PKG_DIR}/bin/libfftw3_omp-3.dll" ] || [ -f "${PKG_DIR}/bin/libfftw3_omp.dll" ]; then
+    rm -f "${PKG_DIR}/bin/libfftw3_omp-3.dll" "${PKG_DIR}/bin/libfftw3_omp.dll"
+    log "  - removed libfftw3_omp*.dll from package (use threads backend)"
+  fi
+
   # Hard gate: portable ZIP must never ship AWS/S3 HDF5 deps (libaws*).
   local aws_hits
   aws_hits="$(find "${PKG_DIR}" -iname 'libaws*' 2>/dev/null | head -20 || true)"
@@ -561,13 +785,14 @@ set PATH=%~dp0bin;%PATH%
 REM OpenBLAS (MSYS2) is OpenMP-threaded; under mpiexec -n N each rank must use
 REM a single BLAS thread, otherwise cores are oversubscribed and OpenBLAS's
 REM buffer allocator can fail. Pin both vars (OMP_NUM_THREADS is authoritative).
+REM Pass -env so ranks get the pins even if the parent env is cleared.
 set OMP_NUM_THREADS=1
 set OPENBLAS_NUM_THREADS=1
 REM Multi-rank MS-MPI requires the MPI_IN_PLACE --wrap shim linked at build
 REM time (shim/msmpi_inplace_wrap.c). See docs/MSYS2_MSMPI_MULTIRANK.md.
 REM Optional: set MSMPI_WRAP_DEBUG=1 to log sentinel rewrites.
 echo Starting VASP on 4 cores...
-.\bin\mpiexec.exe -n 4 .\bin\vasp_std.exe
+.\bin\mpiexec.exe -n 4 -env OMP_NUM_THREADS 1 -env OPENBLAS_NUM_THREADS 1 -env OMP_DYNAMIC FALSE -env OMP_MAX_ACTIVE_LEVELS 1 .\bin\vasp_std.exe
 pause
 BATCH
 }
@@ -623,8 +848,43 @@ package() {
 # main
 #-----------------------------------------------------------------------------
 main() {
+  parse_args "$@"
   log "VASP Windows-native build (MSYS2 UCRT64, route C2)"
+  log "mode: ${VASP_PIPELINE_MODE}"
   preflight
+
+  if [ "${VASP_PIPELINE_MODE}" = "develop" ]; then
+    # Never unpack (would rm -rf WORK_DIR). Reuse tree; stop after build.
+    develop_prepare
+    build
+    local v exe
+    log "develop build outputs (copy into an existing portable bin/ for testsuite):"
+    local pkg_bin="${WORK_DIR}/${PKG_NAME}/bin"
+    for v in ${BUILD_VARIANTS}; do
+      exe="$(ls "${BDIR}/bin/${v}.exe" "${BDIR}/${v}.exe" 2>/dev/null | head -1 || true)"
+      if [ -n "${exe}" ]; then
+        log "  ${exe}"
+        if [ -d "${pkg_bin}" ]; then
+          cp -f "${exe}" "${pkg_bin}/"
+          log "  -> ${pkg_bin}/$(basename "${exe}")"
+        fi
+      else
+        warn "  ${v}.exe not found under ${BDIR}"
+      fi
+    done
+    if [ -d "${pkg_bin}" ]; then
+      if [ -f "${MINGW_PREFIX}/bin/libfftw3_threads-3.dll" ]; then
+        cp -f "${MINGW_PREFIX}/bin/libfftw3_threads-3.dll" "${pkg_bin}/"
+      fi
+      rm -f "${pkg_bin}/libfftw3_omp-3.dll" "${pkg_bin}/libfftw3_omp.dll"
+      log "portable bin refreshed (FFTW threads; omp DLL removed): ${pkg_bin}"
+    fi
+    log "BDIR=${BDIR}"
+    log "PKG_DIR hint (if previously harvested): ${WORK_DIR}/${PKG_NAME}"
+    log "DONE (develop) — skipped harvest/package/zip"
+    return 0
+  fi
+
   unpack
   setup
   patch_sources

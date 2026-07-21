@@ -23,7 +23,7 @@ binaries.** You must provide your own licensed VASP tarball outside this repo.
 | `build_pipeline.sh`   | **Single source of truth** — one-command driver (preflight → zip)  |
 | `toolchain/`          | Thin English entry points (deps / env / call pipeline / testsuite) |
 | `testsuite_overlays/` | MS-MPI fast/all conf overlays copied into extracted `testsuite/`   |
-| `patches/`            | Win32 timing patches (`getrusage` → `GetProcessTimes`)             |
+| `patches/`            | Win32 timing + MAXMEM (`/proc/meminfo` → WinAPI) patches           |
 | `vasp_cmake/`         | Official VASP CMake port (**git submodule**)                       |
 
 
@@ -128,23 +128,38 @@ You may still call the pipeline directly:
 bash build_pipeline.sh /c/path/to/vasp.6.6.0.tgz
 ```
 
-Stages: `preflight → unpack → setup → patch → configure → build → harvest → package`.
+**Modes** (`VASP_PIPELINE_MODE`, default `release`):
+
+| Mode | Behavior |
+| --- | --- |
+| `release` | Full pipeline through portable ZIP |
+| `develop` | Reuse existing `build_work` (never `rm -rf`); rebuild only; skip harvest/package/zip |
+
+```bash
+# After one successful release unpack/configure:
+VASP_PIPELINE_MODE=develop VASP_TARBALL=/c/path/to/vasp.6.6.0.tgz bash build_pipeline.sh
+# same: bash build_pipeline.sh --develop /c/path/to/vasp.6.6.0.tgz
+# Then copy new build/bin/vasp_*.exe over an existing portable bin/ for testsuite.
+```
+
+Stages (`release`): `preflight → unpack → setup → patch → configure → build → harvest → package`.
 
 **Output (local, gitignored):** `vasp-6.6.0-msys2-portable.zip` (+ `.sha256`).
 
 ### Tunables
 
 
-| Variable           | Default                      | Purpose                                                             |
-| ------------------ | ---------------------------- | ------------------------------------------------------------------- |
-| `VASP_TARBALL`     | `$1`                         | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
-| `TARGET_CPU`       | `x86-64`                     | CPU baseline (`-march=`); use `native` for local speed              |
-| `NUM_CORES`        | *(unset)*                    | Override ninja `-j` (else RAM-capped `nproc`)                       |
-| `BUILD_VARIANTS`   | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle                                              |
-| `PKG_NAME`         | `vasp-6.6.0-msys2-portable`  | Artifact name                                                       |
-| `MINGW_PREFIX`     | `/ucrt64`                    | Resolved with `pwd -P` (Scoop symlinks OK)                          |
-| `ALLOW_NON_UCRT64` | *(unset)*                    | Set `1` to skip the UCRT64 hard gate                                |
-| `MSMPI_BIN`        | *(auto)*                     | Directory containing host `mpiexec.exe`                             |
+| Variable              | Default                      | Purpose                                                             |
+| --------------------- | ---------------------------- | ------------------------------------------------------------------- |
+| `VASP_TARBALL`        | `$1`                         | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
+| `VASP_PIPELINE_MODE`  | `release`                    | `release` (ZIP) or `develop` (rebuild only; no unpack wipe)         |
+| `TARGET_CPU`          | `x86-64`                     | CPU baseline (`-march=`); use `native` for local speed              |
+| `NUM_CORES`           | *(unset)*                    | Override ninja `-j` (else RAM-capped `nproc`)                       |
+| `BUILD_VARIANTS`      | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle                                              |
+| `PKG_NAME`            | `vasp-6.6.0-msys2-portable`  | Artifact name                                                       |
+| `MINGW_PREFIX`        | `/ucrt64`                    | Resolved with `pwd -P` (Scoop symlinks OK)                          |
+| `ALLOW_NON_UCRT64`    | *(unset)*                    | Set `1` to skip the UCRT64 hard gate                                |
+| `MSMPI_BIN`           | *(auto)*                     | Directory containing host `mpiexec.exe`                             |
 
 
 For a stage-by-stage walkthrough, see [STEP_BY_STEP.md](STEP_BY_STEP.md).
@@ -194,11 +209,18 @@ against the portable `bin/` with the MSYS2/MS-MPI overlays. A repo-root
 `testsuite/` copy (if present) is inspection-only; runtime uses the extracted
 tree plus `testsuite_overlays/`.
 
+Upstream docs: [Validation tests](https://vasp.at/wiki/Validation_tests).
+Official entry points are `make test` / `make test_all` or `./runtest`
+(`-f` = FAST category ≈ 1.5 h on 4 cores; `-a` = all). **Single recipes** are
+selected with `VASP_TESTSUITE_TESTS` (not as extra argv to `./runtest`).
+
 ```bash
-# UCRT64 — FAST category (default): WORK_DIR/vasp.*/testsuite + portable bin/
+# UCRT64 — FAST category (default overlay). Do NOT run this casually while debugging.
 bash toolchain/run_testsuite.sh
 bash toolchain/run_testsuite.sh --all    # full suite
-# MODE=all bash toolchain/run_testsuite.sh
+# Single / few recipes (recommended for debugging):
+bash toolchain/run_testsuite.sh --fast bulk_GaAs_ACFDT
+VASP_TESTSUITE_TESTS='bulk_BN_PBE0' bash toolchain/run_testsuite.sh --fast
 ```
 
 Overrides:
@@ -206,8 +228,7 @@ Overrides:
 ```bash
 export TESTSUITE_ROOT='/c/path/to/vasp.6.6.0/testsuite'
 export VASP_PORTABLE_BIN='/c/path/to/vasp-6.6.0-msys2-portable/bin'
-bash toolchain/run_testsuite.sh          # msys2_msmpi_fast.conf
-bash toolchain/run_testsuite.sh --all    # msys2_msmpi_all.conf
+bash toolchain/run_testsuite.sh --fast bulk_GaAs_ACFDT
 ```
 
 What the runner does:
@@ -217,9 +238,11 @@ What the runner does:
 2. Copies `testsuite_overlays/msys2_msmpi_{fast,all}.conf` into that directory
 3. Builds `compare_numbertable_new` (gfortran) into `${TESTSUITE_ROOT}/tools/`
 4. Sets `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, and `PATH` for the
-   portable `bin/`
-5. Runs `./runtest msys2_msmpi_fast.conf` or `msys2_msmpi_all.conf`
-   (MS-MPI `mpiexec` + `vasp_{std,gam,ncl}.exe`)
+   portable `bin/`; exports positional recipe names as `VASP_TESTSUITE_TESTS`
+5. Runs `./runtest msys2_msmpi_fast.conf` or `msys2_msmpi_all.conf` **with the
+   config file only** (MS-MPI `mpiexec` + `vasp_{std,gam,ncl}.exe`)
+
+Never run two `run_testsuite.sh` / `--fast` instances concurrently.
 
 ---
 
@@ -227,11 +250,17 @@ What the runner does:
 
 ## 4. What we patch (and why)
 
-Only two **timing/reporting** C files get a Win32 branch
-(`src/lib/dclock_.c`, `src/lib/timing_.c`). MinGW-w64 does not provide
-`getrusage()`; the patches use `GetProcessTimes()` instead.
+**Timing (`src/lib/dclock_.c`, `src/lib/timing_.c`):** MinGW-w64 does not provide
+`getrusage()`; the patches use `GetProcessTimes()` instead. This affects OUTCAR
+timing/resource statistics only — not the physics.
 
-**This affects OUTCAR timing/resource statistics only — not the physics.**
+**MAXMEM auto-detect (`src/ini.F`):** Native Windows PE has no `/proc/meminfo`,
+so upstream `AUTOSET_AVAILABLE_MEMORY` would keep the default 2800 MB and emit a
+tutor alert. A small C helper (`shim/win32_available_memory.c`) uses
+`GlobalMemoryStatusEx`; the Fortran path falls back to it when `/proc/meminfo`
+is missing. Semantics (≈90% of available RAM, per-rank split, MPI min across
+nodes) are unchanged. See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md).
+
 Patches live in `patches/` and are applied idempotently.
 
 Everything else uses official CMake options (`VASP_OPENMP=ON`, `VASP_FFTLIB=ON`
@@ -258,7 +287,8 @@ that defines missing `RTLD_NOLOAD` — no System-V shared memory.
 | Real MinGW DLL `not found`                              | Check Scoop-resolved `MINGW_PREFIX`; re-run harvest or copy missing DLL into `bin/`                                                                                                                                                                                                                |
 | OpenBLAS crash under MPI                                | Keep `OMP_NUM_THREADS=1` / `OPENBLAS_NUM_THREADS=1` in `run.bat`                                                                                                                                                                                                                                   |
 | Missing `mpiexec.exe` in package                        | Install host MS-MPI (`scoop install msmpi` or official setup); set `MSMPI_BIN` if needed                                                                                                                                                                                                           |
-| `mpiexec -n 2` crashes (MSYS2/MS-MPI); `-n 1` OK        | **Fixed in current builds** via linker `--wrap` shim -- see [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md) and [docs/MSYS2_MSMPI_MULTIRANK.md](docs/MSYS2_MSMPI_MULTIRANK.md). Rebuild with current `build_pipeline.sh`. Older ZIPs without the shim: use `-n 1` or an Intel MPI package |
+| `mpiexec -n 2` crashes (MSYS2/MS-MPI); `-n 1` OK        | **Fixed in current builds** via linker `--wrap` shim -- see [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md) and [docs/MSYS2_MSMPI_MULTIRANK.md](docs/MSYS2_MSMPI_MULTIRANK.md). Rebuild with current `build_pipeline.sh`. Older ZIPs without the shim: use `-n 1` or an Intel MPI package. ACFDT-style multi-rank `MPI_DATATYPE_NULL` on `mpi_allreduce_` is a **further mitigation** in the same shim (not a root-cause fix) — see [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md#further-mitigation-null-datatype-on-acfdt-2026-07-21) |
+| Tutor alert: failed to set available memory / MAXMEM=2800 | **Fixed in current builds** — WinAPI fallback when `/proc/meminfo` is missing; see [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md). Or set `MAXMEM` in `INCAR` by hand. |
 
 
 ---

@@ -3,12 +3,20 @@
 # run_testsuite.sh — run VASP testsuite against a portable MSYS2/MS-MPI build
 #
 # UCRT64 shell:
-#   bash toolchain/run_testsuite.sh              # FAST (default)
+#   bash toolchain/run_testsuite.sh              # FAST category (default overlay)
 #   bash toolchain/run_testsuite.sh --all        # full suite
 #   MODE=all bash toolchain/run_testsuite.sh
+#   # Single / few recipes (official: VASP_TESTSUITE_TESTS) — NOT a positional
+#   # arg to upstream ./runtest. This wrapper accepts names for convenience:
+#   bash toolchain/run_testsuite.sh --fast bulk_GaAs_ACFDT
+#   VASP_TESTSUITE_TESTS='bulk_GaAs_ACFDT bulk_BN_PBE0' bash toolchain/run_testsuite.sh
 #   TESTSUITE_ROOT=/c/path/to/vasp.6.6.0/testsuite \
 #     VASP_PORTABLE_BIN=/c/path/to/vasp-*-msys2-portable/bin \
 #     bash toolchain/run_testsuite.sh
+#
+# Upstream ./runtest CLI is only: [-f|--fast|-a|--all] [config-file]
+# Recipe selection is via VASP_TESTSUITE_TESTS (see vasp.at wiki Validation_tests).
+# Extra names after --fast/--all here are exported as VASP_TESTSUITE_TESTS.
 #
 # This repo does NOT ship the licensed testsuite/. The runner:
 #   1) Locates extracted testsuite with runtest:
@@ -16,7 +24,7 @@
 #      (repo-root /testsuite is inspection-only — never used to run)
 #   2) Copies testsuite_overlays/msys2_msmpi_{fast,all}.conf into that directory
 #   3) Builds compare_numbertable_new into testsuite/tools/ (ephemeral)
-#   4) Sets thread env + PATH, then runs ./runtest with the overlay conf
+#   4) Sets thread env + PATH, then runs ./runtest <overlay.conf> only
 # =============================================================================
 set -euo pipefail
 
@@ -178,6 +186,17 @@ case "${MODE}" in
   *) die "MODE must be fast or all (got: ${MODE})" ;;
 esac
 
+# Positional recipe names → VASP_TESTSUITE_TESTS (upstream ignores extras on ./runtest).
+# Explicit env wins if already set.
+if [ "${#RUNTEST_ARGS[@]}" -gt 0 ]; then
+  if [ -n "${VASP_TESTSUITE_TESTS:-}" ]; then
+    warn "ignoring positional recipes (${RUNTEST_ARGS[*]}); VASP_TESTSUITE_TESTS already set"
+  else
+    export VASP_TESTSUITE_TESTS="${RUNTEST_ARGS[*]}"
+    log "VASP_TESTSUITE_TESTS=${VASP_TESTSUITE_TESTS}"
+  fi
+fi
+
 OVERLAY_CONF_NAME="msys2_msmpi_${MODE}.conf"
 CONF_BASENAME="${OVERLAY_CONF_NAME}"
 
@@ -212,6 +231,14 @@ log "MODE=${MODE}"
 log "TESTSUITE_ROOT=${TESTSUITE_ROOT}"
 log "VASP_PORTABLE_BIN=${VASP_PORTABLE_BIN}"
 log "overlay=${OVERLAY_CONF_NAME}"
+if [ -n "${VASP_TESTSUITE_TESTS:-}" ]; then
+  log "single/selected recipes: VASP_TESTSUITE_TESTS=${VASP_TESTSUITE_TESTS}"
+else
+  log "no VASP_TESTSUITE_TESTS — will run full ${MODE} category from overlay"
+fi
+if [ -n "${MSMPI_WRAP_DEBUG:-}" ] && [ "${MSMPI_WRAP_DEBUG}" != "0" ]; then
+  warn "MSMPI_WRAP_DEBUG=${MSMPI_WRAP_DEBUG} — overlay will pass it via mpiexec -env (rank0/rate-limited in current shim). Unset for clean PASS/FAIL logs."
+fi
 
 cp -f "${OVERLAY_SRC}" "${TESTSUITE_ROOT}/${CONF_BASENAME}"
 log "copied overlay -> ${TESTSUITE_ROOT}/${CONF_BASENAME}"
@@ -225,6 +252,85 @@ case ":${PATH}:" in
   *) export PATH="${VASP_PORTABLE_BIN}:${PATH}" ;;
 esac
 
+# fftlib may dlopen("libfftw3_omp.so") even when the exe is linked to
+# libfftw3_threads. If UCRT64 is on PATH, that loads the OpenMP FFTW DLL +
+# libgomp into plan creation (bulk_BN_PBE0 n4 SIGSEGV). Drop any PATH entry
+# that hosts real libfftw3_omp*, and never leave that DLL in portable bin/.
+# Diagnostic override: VASP_TESTSUITE_ALLOW_FFTW_OMP=1 keeps omp DLL / PATH
+# for stock-libfftw3_omp A/B (exe must actually link libfftw3_omp).
+# (compare_numbertable_new is already built above; gfortran not needed here.)
+if [ "${VASP_TESTSUITE_ALLOW_FFTW_OMP:-0}" = "1" ]; then
+  log "VASP_TESTSUITE_ALLOW_FFTW_OMP=1 — keep libfftw3_omp on PATH / portable bin"
+  if [ ! -f "${VASP_PORTABLE_BIN}/libfftw3_omp-3.dll" ] \
+     && [ -f "${MINGW_PREFIX:-/ucrt64}/bin/libfftw3_omp-3.dll" ]; then
+    cp -f "${MINGW_PREFIX}/bin/libfftw3_omp-3.dll" "${VASP_PORTABLE_BIN}/"
+    log "staged libfftw3_omp-3.dll into portable bin (stock OMP A/B)"
+  fi
+else
+  if [ -f "${VASP_PORTABLE_BIN}/libfftw3_omp-3.dll" ] || [ -f "${VASP_PORTABLE_BIN}/libfftw3_omp.dll" ]; then
+    rm -f "${VASP_PORTABLE_BIN}/libfftw3_omp-3.dll" "${VASP_PORTABLE_BIN}/libfftw3_omp.dll"
+    log "removed libfftw3_omp*.dll from portable bin (prefer linked libfftw3_threads)"
+  fi
+  if [ ! -f "${VASP_PORTABLE_BIN}/libfftw3_threads-3.dll" ] && [ -f "${MINGW_PREFIX:-/ucrt64}/bin/libfftw3_threads-3.dll" ]; then
+    cp -f "${MINGW_PREFIX}/bin/libfftw3_threads-3.dll" "${VASP_PORTABLE_BIN}/"
+    log "staged libfftw3_threads-3.dll into portable bin"
+  fi
+  _new_path=""
+  while IFS= read -r _dir; do
+    [ -n "${_dir}" ] || continue
+    if [ "${_dir}" != "${VASP_PORTABLE_BIN}" ] \
+       && { [ -f "${_dir}/libfftw3_omp-3.dll" ] || [ -f "${_dir}/libfftw3_omp.dll" ]; }; then
+      log "PATH: drop ${_dir} (contains libfftw3_omp; avoid fftlib dlopen)"
+      continue
+    fi
+    if [ -z "${_new_path}" ]; then
+      _new_path="${_dir}"
+    else
+      _new_path="${_new_path}:${_dir}"
+    fi
+  done < <(printf '%s\n' "${PATH}" | tr ':' '\n')
+  export PATH="${_new_path}"
+  unset _new_path _dir
+fi
+
 cd "${TESTSUITE_ROOT}"
-log "running: ./runtest ${CONF_BASENAME} ${RUNTEST_ARGS[*]:-}"
-./runtest "${CONF_BASENAME}" ${RUNTEST_ARGS[@]+"${RUNTEST_ARGS[@]}"}
+# Match upstream ./runtest -f: non-empty TESTS overrules RUN_FAST from the conf.
+if [ -n "${VASP_TESTSUITE_TESTS:-}" ]; then
+  export VASP_TESTSUITE_RUN_FAST=""
+fi
+# Upstream CLI: ./runtest [config-file] only — do NOT pass recipe names as argv.
+log "running: ./runtest ${CONF_BASENAME}"
+set +e
+./runtest "${CONF_BASENAME}"
+rc=$?
+set -e
+
+# Clearer failure footer: upstream SUMMARY can be buried / false-FAIL when
+# MSMPI_WRAP_DEBUG used to interleave stderr. Prefer explicit exit + hints.
+if [ "${rc}" -ne 0 ]; then
+  warn "runtest exited ${rc}"
+  if [ -n "${VASP_TESTSUITE_TESTS:-}" ]; then
+    _first_recipe="${VASP_TESTSUITE_TESTS%% *}"
+    _recipe_dir="${TESTSUITE_ROOT}/tests/${_first_recipe}"
+    if [ -d "${_recipe_dir}" ]; then
+      log "failure hints for ${_first_recipe}:"
+      if [ -f "${_recipe_dir}/FAILED" ]; then
+        warn "  marker: ${_recipe_dir}/FAILED"
+      fi
+      if [ -f "${_recipe_dir}/stdout" ]; then
+        log "  last 30 lines of tests/${_first_recipe}/stdout:"
+        tail -n 30 "${_recipe_dir}/stdout" 2>/dev/null || true
+      elif [ -f "${_recipe_dir}/OUTCAR" ]; then
+        log "  OUTCAR present (${_recipe_dir}/OUTCAR); stdout capture missing"
+      else
+        warn "  no stdout/OUTCAR under ${_recipe_dir} (crash before I/O?)"
+      fi
+    fi
+    unset _first_recipe _recipe_dir
+  else
+    warn "full ${MODE} run failed — scroll to upstream SUMMARY, or re-run with VASP_TESTSUITE_TESTS=<recipe>"
+  fi
+  exit "${rc}"
+fi
+log "runtest OK (exit 0)"
+exit 0

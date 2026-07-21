@@ -1,0 +1,63 @@
+--- a/src/ini.F
++++ b/src/ini.F
+@@ -716,6 +716,15 @@
+       INTEGER                :: IUNIT = 101
+       REAL(q), PARAMETER     :: PERCENT=0.90_q ! how much percent of available
+                                               ! memory should be used actually
++      ! Win32: no /proc/meminfo - call GlobalMemoryStatusEx via C helper
++      INTERFACE
++         FUNCTION vasp_win32_available_memory_kb() &
++            BIND(C, NAME='vasp_win32_available_memory_kb')
++            USE, INTRINSIC :: ISO_C_BINDING, ONLY: C_INT64_T
++            IMPLICIT NONE
++            INTEGER(C_INT64_T) :: vasp_win32_available_memory_kb
++         END FUNCTION vasp_win32_available_memory_kb
++      END INTERFACE
+ #ifdef MPI
+       NCPU = COMM_INTRA_NODE_WORLD%NCPU
+       NCPU_NODE = COMM_INTRA_NODE_WORLD%NCPU
+@@ -728,24 +737,27 @@
+       ! only master rank on node reads /proc/meminfo
+       IF ( NODE_ME == 1 ) THEN
+          INQUIRE( FILE='/proc/meminfo', EXIST=LEXIST ) 
+-         IF ( .NOT. LEXIST ) THEN
+-            IERROR = 1
+-            GOTO 1000
++         IF ( LEXIST ) THEN
++            ! Linux: parse MemAvailable from /proc/meminfo
++            OPEN( UNIT=IUNIT, FILE='/proc/meminfo', STATUS='OLD', IOSTAT=IERROR )
++            IF ( IERROR /=0 ) THEN
++               GOTO 1000
++            ENDIF
++
++            CALL FIND_FREE_MEMORY_ENTRY( IUNIT, IERROR, MEMSIZE )
++
++            ! determine available RAM per rank on node
++            MEMSIZE = MEMSIZE / NCPU_NODE
++         ELSE
++            ! Native Windows PE: no /proc/meminfo - WinAPI C helper
++            ! (shim/win32_available_memory.c -> GlobalMemoryStatusEx, kB)
++            MEMSIZE = vasp_win32_available_memory_kb()
++            IF ( MEMSIZE <= 0 ) THEN
++               IERROR = 1
++               GOTO 1000
++            ENDIF
++            MEMSIZE = MEMSIZE / NCPU_NODE
+          ENDIF
+-         
+-         ! open file that contains information about memory 
+-         OPEN( UNIT=IUNIT, FILE='/proc/meminfo', STATUS='OLD', IOSTAT=IERROR )
+-         IF ( IERROR /=0 ) THEN
+-            GOTO 1000 
+-         ENDIF
+-  
+-         ! find correct entry in file and proceed 
+-         CALL FIND_FREE_MEMORY_ENTRY( IUNIT, IERROR, MEMSIZE ) 
+-
+-         ! 
+-         ! determine available RAM per rank on node
+-         ! 
+-         MEMSIZE = MEMSIZE / NCPU_NODE
+       ENDIF 
+ 
+                    

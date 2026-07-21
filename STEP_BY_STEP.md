@@ -114,12 +114,13 @@ ls -l "$SRC_ROOT/src/lib/CMakeLists.txt"
 
 ---
 
-## Stage 3 — Apply Win32 timing patches
+## Stage 3 — Apply Win32 patches
 
 ```bash
 cd "$SRC_ROOT"
 patch --forward -p1 < "$PATCH_DIR/0001-dclock_-win32-getrusage.patch"
 patch --forward -p1 < "$PATCH_DIR/0002-timing_-win32-getrusage.patch"
+patch --forward -p1 < "$PATCH_DIR/0004-autoset-available-memory-win32.patch"
 cd "$DELIV"
 ```
 
@@ -128,9 +129,11 @@ cd "$DELIV"
 ```bash
 grep -c win32_filetime_to_sec "$SRC_ROOT/src/lib/dclock_.c"   # expect >0
 grep -c win32_filetime_to_sec "$SRC_ROOT/src/lib/timing_.c"   # expect >0
+grep -c vasp_win32_available_memory_kb "$SRC_ROOT/src/ini.F"  # expect >0
 ```
 
 Re-running is safe if a patch says "already applied".
+See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md) for the MAXMEM helper.
 
 ---
 

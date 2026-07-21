@@ -8,10 +8,11 @@ Portable MSYS2/UCRT64 **build scripts and packaging** for VASP on Windows. This 
 
 ## Hard bans
 
-- **Never** read, search, open, unpack, or dump into context:
+- **Never** read, search (including grep/rg/Select-String), open, unpack, or dump into context:
   - user VASP tarballs (`*.tar.gz`, `*.tgz`, `vasp*.zip`, and similar)
-  - `build_work/` trees or any extracted upstream source under the work directory
+  - **any** content under `build_work/` that is upstream/extracted source — including `*.F`, `*.f90`, `*.hpp`, `src/**`, and fftlib headers (headers count; “no Fortran hit” is still a violation)
   - `potpaw*` archives, `POTCAR`, or other pseudopotential / licensed potential files
+- **Stop-and-ask:** if you believe reading any `build_work/` upstream file is required, **stop**, state what and why, and wait for **explicit user approval**. Do not search or read first.
 - **Never** commit or `git push` build artifacts or licensed materials, including:
   - portable ZIPs (`*.zip`), `build_work/`, VASP tarballs, `POTCAR` / potpaw
   - This repo typically has **no remotes configured**. Do **not** add a remote or push unless the user **explicitly** asks.
@@ -23,6 +24,7 @@ Portable MSYS2/UCRT64 **build scripts and packaging** for VASP on Windows. This 
 - `patches/` (Windows/MSYS2 build fixes; keep changes minimal and documented)
 - English documentation (`README.md`, `STEP_BY_STEP.md`, `CONTRIBUTING.md`, `docs/`)
 - Future thin `toolchain/` wrappers (env / deps entry points that call `build_pipeline.sh`)
+- Binary/debug inspection **without** reading source: `nm` / `objdump` / `ntldd` / `strings` on `*.exe`/`*.dll`; gdb **symbol names**; build/test logs and exit codes
 
 ## Build protocol
 
@@ -30,7 +32,7 @@ When the user **explicitly authorizes** a build:
 
 1. Run the pipeline via shell (e.g. `bash build_pipeline.sh` under UCRT64).
 2. Inspect **logs, compiler errors, exit codes, and ZIP listings** only.
-3. Do **not** open or search VASP Fortran/C++ sources from the extracted tree into agent context.
+3. Do **not** open or search VASP Fortran/C++/header sources from the extracted tree into agent context (see stop-and-ask above).
 
 ```text
 # GOOD — authorized build

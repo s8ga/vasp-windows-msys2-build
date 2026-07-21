@@ -84,15 +84,22 @@ Documented from most practical for this repo’s users to most advanced.
 
 Full write-up: [MSMPI_INPLACE_SHIM.md](MSMPI_INPLACE_SHIM.md).
 
-Full write-up: [MSMPI_INPLACE_SHIM.md](MSMPI_INPLACE_SHIM.md).
-
 Stock MSYS2 gfortran does not need a rebuilt compiler. At **link** time we:
 
 1. Compile [`shim/msmpi_inplace_wrap.c`](../shim/msmpi_inplace_wrap.c).
 2. Pass the object plus `-Wl,--wrap=mpi_<sym>_` for each wrapped Fortran stub.
-3. Each wrapper maps the fake Fortran COMMON address
-   (`&mpipriv1_.mpi_in_place` / `&mpipriv1_.mpi_bottom`) to the real C
-   sentinels `MPI_IN_PLACE` / `MPI_BOTTOM`, then calls the **C** MPI API.
+3. Each wrapper maps the fake **local** Fortran COMMON address
+   (`&mpipriv1_.mpi_in_place` / `&mpipriv1_.mpi_bottom`) to the **MS-MPI DLL**
+   COMMON (`*__imp_mpipriv1_`), then calls `__real_mpi_*_` (original Fortran
+   stub). Avoids C `MPI_*` + `MPI_Type_f2c`, which can break some Fortran
+   handles (`MPI_DATATYPE_NULL` on ACFDT-class jobs).
+4. `mpi_waitall_` similarly maps local `/MPIPRIV2/` `MPI_STATUSES_IGNORE` to
+   the DLL COMMON address; otherwise MS-MPI treats it as writable statuses and
+   overwrites adjacent BSS for multi-request waits (about `count * 20` bytes).
+   That overflow was the confirmed root of the `bulk_BN_PBE0` n4
+   `GOMP_critical` / `libwinpthread` SIGSEGV (and wrong forces after an SRW-only
+   workaround). Full write-up: [MSMPI_INPLACE_SHIM.md](MSMPI_INPLACE_SHIM.md)
+   (`/MPIPRIV2/` subsection). `VASP_GOMP_CRITICAL_WIN32` stays **OFF** by default.
 
 `build_pipeline.sh` `configure()` enables this automatically.
 
@@ -117,6 +124,7 @@ gcc -c shim/msmpi_inplace_wrap.c -I${MINGW_PREFIX}/include -o build/msmpi_inplac
   -Wl,--wrap=mpi_alltoall_
   -Wl,--wrap=mpi_alltoallv_
   -Wl,--wrap=mpi_iallgather_
+  -Wl,--wrap=mpi_waitall_
   -Wl,--wrap=mpi_get_
   + msmpi_inplace_wrap.o
 ```
