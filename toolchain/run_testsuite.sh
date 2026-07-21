@@ -3,15 +3,18 @@
 # run_testsuite.sh — run VASP testsuite against a portable MSYS2/MS-MPI build
 #
 # UCRT64 shell:
-#   bash toolchain/run_testsuite.sh
-#   bash toolchain/run_testsuite.sh --fast
+#   bash toolchain/run_testsuite.sh              # FAST (default)
+#   bash toolchain/run_testsuite.sh --all        # full suite
+#   MODE=all bash toolchain/run_testsuite.sh
 #   TESTSUITE_ROOT=/c/path/to/vasp.6.6.0/testsuite \
 #     VASP_PORTABLE_BIN=/c/path/to/vasp-*-msys2-portable/bin \
 #     bash toolchain/run_testsuite.sh
 #
 # This repo does NOT ship the licensed testsuite/. The runner:
-#   1) Locates extracted SRC_ROOT/testsuite (or TESTSUITE_ROOT)
-#   2) Copies testsuite_overlays/msys2_msmpi.conf into that directory
+#   1) Locates extracted testsuite with runtest:
+#        TESTSUITE_ROOT > SRC_ROOT/testsuite > WORK_DIR/*/testsuite
+#      (repo-root /testsuite is inspection-only — never used to run)
+#   2) Copies testsuite_overlays/msys2_msmpi_{fast,all}.conf into that directory
 #   3) Builds compare_numbertable_new into testsuite/tools/ (ephemeral)
 #   4) Sets thread env + PATH, then runs ./runtest with the overlay conf
 # =============================================================================
@@ -20,9 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OVERLAY_DIR="${TESTSUITE_OVERLAY_DIR:-${REPO_ROOT}/testsuite_overlays}"
-OVERLAY_CONF_NAME="${OVERLAY_CONF_NAME:-msys2_msmpi.conf}"
 WORK_DIR="${WORK_DIR:-${REPO_ROOT}/build_work}"
-CONF_BASENAME="${OVERLAY_CONF_NAME}"
 
 log()  { printf '\033[1;34m[testsuite]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -39,6 +40,7 @@ to_msys_path() {
 
 #-----------------------------------------------------------------------------
 # Locate extracted testsuite (licensed tree under build_work / unpack)
+# Never use repo-root /testsuite (inspection copy only).
 #-----------------------------------------------------------------------------
 resolve_testsuite_root() {
   if [ -n "${TESTSUITE_ROOT:-}" ]; then
@@ -70,14 +72,15 @@ resolve_testsuite_root() {
     done < <(find "${WORK_DIR}" -maxdepth 3 -type f -name runtest -path '*/testsuite/runtest' 2>/dev/null | sort -r)
   fi
 
-  # Accidental unpack beside repo (gitignored) — still usable, never committed
+  # Hard-disabled: repo-root /testsuite is for human/agent inspection only.
   if [ -f "${REPO_ROOT}/testsuite/runtest" ]; then
-    warn "using ${REPO_ROOT}/testsuite (gitignored licensed tree); prefer WORK_DIR unpack"
-    printf '%s' "${REPO_ROOT}/testsuite"
-    return 0
+    warn "found ${REPO_ROOT}/testsuite (inspection-only copy; not used for runtest)"
   fi
 
-  die "could not find testsuite/runtest. Set TESTSUITE_ROOT=.../testsuite or unpack VASP under WORK_DIR=${WORK_DIR}"
+  die "could not find an extracted VASP testsuite with runtest.
+  Unpack your licensed VASP tarball (e.g. under WORK_DIR=${WORK_DIR}),
+  or set TESTSUITE_ROOT=/path/to/vasp.*/testsuite
+  (repo-root /testsuite is inspection-only and is never used to run tests)."
 }
 
 #-----------------------------------------------------------------------------
@@ -144,6 +147,41 @@ build_compare_tool() {
 }
 
 #-----------------------------------------------------------------------------
+# Mode: fast (default) | all  — selects overlay conf (mirrors upstream confs)
+#-----------------------------------------------------------------------------
+MODE="${MODE:-fast}"
+RUNTEST_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --fast|-f)
+      MODE=fast
+      shift
+      ;;
+    --all|-a)
+      MODE=all
+      shift
+      ;;
+    --)
+      shift
+      RUNTEST_ARGS+=("$@")
+      break
+      ;;
+    *)
+      RUNTEST_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+case "${MODE}" in
+  fast|all) ;;
+  *) die "MODE must be fast or all (got: ${MODE})" ;;
+esac
+
+OVERLAY_CONF_NAME="msys2_msmpi_${MODE}.conf"
+CONF_BASENAME="${OVERLAY_CONF_NAME}"
+
+#-----------------------------------------------------------------------------
 # Main
 #-----------------------------------------------------------------------------
 # Optional: source UCRT64 env when available (PATH / MINGW_PREFIX)
@@ -170,6 +208,7 @@ export VASP_MPIEXEC="${MPIEXEC}"
 export VASP_PORTABLE_BIN
 export VASP_TESTSUITE_NRANKS="${VASP_TESTSUITE_NRANKS:-4}"
 
+log "MODE=${MODE}"
 log "TESTSUITE_ROOT=${TESTSUITE_ROOT}"
 log "VASP_PORTABLE_BIN=${VASP_PORTABLE_BIN}"
 log "overlay=${OVERLAY_CONF_NAME}"
@@ -186,36 +225,6 @@ case ":${PATH}:" in
   *) export PATH="${VASP_PORTABLE_BIN}:${PATH}" ;;
 esac
 
-# Extra args after -- are passed to runtest; bare --fast/--all replace default conf mode
-RUNTEST_ARGS=()
-USE_CONF=1
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --fast|--all|-f|-a)
-      USE_CONF=0
-      RUNTEST_ARGS+=("$1")
-      shift
-      ;;
-    --)
-      shift
-      RUNTEST_ARGS+=("$@")
-      break
-      ;;
-    *)
-      RUNTEST_ARGS+=("$1")
-      shift
-      ;;
-  esac
-done
-
 cd "${TESTSUITE_ROOT}"
-if [ "${USE_CONF}" -eq 1 ]; then
-  log "running: ./runtest ${CONF_BASENAME} ${RUNTEST_ARGS[*]:-}"
-  ./runtest "${CONF_BASENAME}" ${RUNTEST_ARGS[@]+"${RUNTEST_ARGS[@]}"}
-else
-  # --fast/--all: still export EXE_* from overlay by sourcing it first
-  # shellcheck disable=SC1090
-  source "${TESTSUITE_ROOT}/${CONF_BASENAME}"
-  log "running: ./runtest ${RUNTEST_ARGS[*]}"
-  ./runtest "${RUNTEST_ARGS[@]}"
-fi
+log "running: ./runtest ${CONF_BASENAME} ${RUNTEST_ARGS[*]:-}"
+./runtest "${CONF_BASENAME}" ${RUNTEST_ARGS[@]+"${RUNTEST_ARGS[@]}"}

@@ -22,7 +22,7 @@ binaries.** You must provide your own licensed VASP tarball outside this repo.
 | --------------------- | ------------------------------------------------------------------ |
 | `build_pipeline.sh`   | **Single source of truth** — one-command driver (preflight → zip)  |
 | `toolchain/`          | Thin English entry points (deps / env / call pipeline / testsuite) |
-| `testsuite_overlays/` | MS-MPI conf overlay copied into extracted VASP `testsuite/`        |
+| `testsuite_overlays/` | MS-MPI fast/all conf overlays copied into extracted `testsuite/`   |
 | `patches/`            | Win32 timing patches (`getrusage` → `GetProcessTimes`)             |
 | `vasp_cmake/`         | Official VASP CMake port (**git submodule**)                       |
 
@@ -190,11 +190,15 @@ does not oversubscribe cores under MPI.
 
 This repository does **not** ship the licensed `testsuite/` tree. After you
 unpack a VASP tarball (e.g. under `build_work/vasp.6.6.0/`), run the harness
-against the portable `bin/` with the MSYS2/MS-MPI overlay:
+against the portable `bin/` with the MSYS2/MS-MPI overlays. A repo-root
+`testsuite/` copy (if present) is inspection-only; runtime uses the extracted
+tree plus `testsuite_overlays/`.
 
 ```bash
-# UCRT64 - defaults: build_work/vasp.*/testsuite + build_work/vasp-*-msys2-portable/bin
+# UCRT64 — FAST category (default): WORK_DIR/vasp.*/testsuite + portable bin/
 bash toolchain/run_testsuite.sh
+bash toolchain/run_testsuite.sh --all    # full suite
+# MODE=all bash toolchain/run_testsuite.sh
 ```
 
 Overrides:
@@ -202,17 +206,20 @@ Overrides:
 ```bash
 export TESTSUITE_ROOT='/c/path/to/vasp.6.6.0/testsuite'
 export VASP_PORTABLE_BIN='/c/path/to/vasp-6.6.0-msys2-portable/bin'
-bash toolchain/run_testsuite.sh          # copies overlay + builds compare tool
-bash toolchain/run_testsuite.sh --fast   # same EXE_* via overlay, runtest --fast
+bash toolchain/run_testsuite.sh          # msys2_msmpi_fast.conf
+bash toolchain/run_testsuite.sh --all    # msys2_msmpi_all.conf
 ```
 
 What the runner does:
 
-1. Copies `testsuite_overlays/msys2_msmpi.conf` into `${TESTSUITE_ROOT}/`
-2. Builds `compare_numbertable_new` (gfortran) into `${TESTSUITE_ROOT}/tools/`
-3. Sets `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, and `PATH` for the
+1. Resolves testsuite: `TESTSUITE_ROOT` → `SRC_ROOT/testsuite` →
+   `WORK_DIR/*/testsuite` (never repo-root `/testsuite`)
+2. Copies `testsuite_overlays/msys2_msmpi_{fast,all}.conf` into that directory
+3. Builds `compare_numbertable_new` (gfortran) into `${TESTSUITE_ROOT}/tools/`
+4. Sets `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, and `PATH` for the
    portable `bin/`
-4. Runs `./runtest msys2_msmpi.conf` (MS-MPI `mpiexec` + `vasp_{std,gam,ncl}.exe`)
+5. Runs `./runtest msys2_msmpi_fast.conf` or `msys2_msmpi_all.conf`
+   (MS-MPI `mpiexec` + `vasp_{std,gam,ncl}.exe`)
 
 ---
 
