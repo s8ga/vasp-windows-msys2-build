@@ -16,9 +16,9 @@ hdf5_ver="1.14.6"
 hdf5_sha256="e4defbac30f50d64e1556374aa49e574417c9e72c6b1de7a4ff88c4b1bea6e9b"
 hdf5_url="https://github.com/HDFGroup/hdf5/releases/download/hdf5_${hdf5_ver}/hdf5-${hdf5_ver}.tar.gz"
 
-# LibXC (ABACUS main pin)
-libxc_ver="7.0.0"
-libxc_sha256="e9ae69f8966d8de6b7585abd9fab588794ada1fab8f689337959a35abbf9527d"
+# LibXC (GitLab archive; latest 7.1.x)
+libxc_ver="7.1.2"
+libxc_sha256="3915fac94416e4c415534223ea492ad2663f928acf27e98662c861b094a6c306"
 libxc_url="https://gitlab.com/libxc/libxc/-/archive/${libxc_ver}/libxc-${libxc_ver}.tar.bz2"
 
 # Wannier90

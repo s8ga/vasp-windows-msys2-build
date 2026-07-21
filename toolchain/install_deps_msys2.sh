@@ -34,6 +34,7 @@ pacman -S --needed \
   mingw-w64-ucrt-x86_64-msmpi \
   mingw-w64-ucrt-x86_64-openblas mingw-w64-ucrt-x86_64-scalapack \
   mingw-w64-ucrt-x86_64-fftw mingw-w64-ucrt-x86_64-zlib \
+  mingw-w64-ucrt-x86_64-dlfcn \
   mingw-w64-ucrt-x86_64-ntldd git tar zip wget
 
 log "MSYS2 packages OK."

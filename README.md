@@ -7,7 +7,7 @@ runtime DLLs, the MS-MPI launcher, and a simple `run.bat`.
 Toolchain (open source + Microsoft MPI):
 
 ```text
-gfortran (UCRT64) + MS-MPI + OpenBLAS + ScaLAPACK(msmpi) + FFTW + HDF5
+gfortran (UCRT64) + MS-MPI + OpenBLAS + ScaLAPACK(msmpi) + FFTW + OpenMP + fftlib + HDF5
 ```
 
 **This repository does not ship VASP source code, POTCAR files, or prebuilt
@@ -61,7 +61,9 @@ bash toolchain/install_deps_msys2.sh
 ```
 
 That installs the pacman packages (gcc/gfortran, cmake, ninja, msmpi,
-OpenBLAS, ScaLAPACK, FFTW, zlib, ntldd, …). HDF5 is **not** from pacman
+OpenBLAS, ScaLAPACK, FFTW, dlfcn, zlib, ntldd, …). `dlfcn` supplies
+`dlfcn.h` / `libdl` so internal **fftlib** (`VASP_FFTLIB=ON`, used with
+OpenMP + FFTW) can build on MinGW. HDF5 is **not** from pacman
 (self-built later via `toolchain/scripts` to avoid `libaws*`). Separately,
 install **host** Microsoft MPI so the pipeline can harvest `mpiexec.exe` /
 `smpd.exe` / `msmpi.dll` into the portable package:
@@ -182,8 +184,11 @@ Only two **timing/reporting** C files get a Win32 branch
 **This affects OUTCAR timing/resource statistics only — not the physics.**
 Patches live in `patches/` and are applied idempotently.
 
-Everything else uses official CMake options (`VASP_SHMEM=OFF`, `VASP_SYSV=OFF`,
-`VASP_TARGET_CPU`, `BLA_VENDOR=OpenBLAS`, explicit MPI Fortran hints).
+Everything else uses official CMake options (`VASP_OPENMP=ON`, `VASP_FFTLIB=ON`
+with FFTW, `VASP_SHMEM=OFF`, `VASP_SYSV=OFF`, `VASP_TARGET_CPU`,
+`BLA_VENDOR=OpenBLAS`, explicit MPI Fortran hints). On MinGW, fftlib needs
+pacman `dlfcn` plus a tiny CMake inject (`shim/cmake_fftlib_win32_inject.cmake`)
+that defines missing `RTLD_NOLOAD` — no System-V shared memory.
 
 ---
 

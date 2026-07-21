@@ -214,6 +214,9 @@ preflight() {
   local lib="${MINGW_PREFIX}/lib"
   [ -f "${lib}/libmsmpi.dll.a" ]    || warn "libmsmpi.dll.a not in ${lib} (msmpi pkg?)"
   ls "${lib}"/libopenblas*.dll.a >/dev/null 2>&1 || warn "OpenBLAS import lib not in ${lib}"
+  # fftlib (VASP_FFTLIB=ON) needs POSIX dlopen; MinGW provides it via dlfcn-win32.
+  [ -f "${MINGW_PREFIX}/include/dlfcn.h" ] \
+    || die "missing dlfcn.h (pacman -S mingw-w64-ucrt-x86_64-dlfcn) — required for VASP_FFTLIB"
 
   log "toolchain OK (gfortran=$(gfortran -dumpversion), cmake=$(cmake --version | head -1 | awk '{print $3}'))"
   log "tarball: ${VASP_TARBALL}"
@@ -332,6 +335,7 @@ patch_sources() {
 #-----------------------------------------------------------------------------
 MSMPI_WRAP_SRC="${MSMPI_WRAP_SRC:-${SCRIPT_DIR}/shim/msmpi_inplace_wrap.c}"
 MSMPI_WRAP_INJECT="${MSMPI_WRAP_INJECT:-${SCRIPT_DIR}/shim/cmake_msmpi_wrap_inject.cmake}"
+FFTLIB_WIN32_INJECT="${FFTLIB_WIN32_INJECT:-${SCRIPT_DIR}/shim/cmake_fftlib_win32_inject.cmake}"
 # Symbols discovered via nm on vasp_std (collectives / RMA that may see IN_PLACE or BOTTOM)
 MSMPI_WRAP_SYMS="${MSMPI_WRAP_SYMS:-mpi_allreduce_ mpi_reduce_ mpi_allgather_ mpi_allgatherv_ mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_get_}"
 
@@ -349,6 +353,7 @@ compile_msmpi_wrap() { # compile_msmpi_wrap <outdir> -> sets MSMPI_WRAP_OBJ (mix
   local obj_unix="${outdir}/msmpi_inplace_wrap.o"
   [ -f "${MSMPI_WRAP_SRC}" ] || die "missing MS-MPI wrap shim: ${MSMPI_WRAP_SRC}"
   [ -f "${MSMPI_WRAP_INJECT}" ] || die "missing MS-MPI wrap CMake inject: ${MSMPI_WRAP_INJECT}"
+  [ -f "${FFTLIB_WIN32_INJECT}" ] || die "missing fftlib win32 CMake inject: ${FFTLIB_WIN32_INJECT}"
   gcc -c "${MSMPI_WRAP_SRC}" -I"${MINGW_PREFIX}/include" -o "${obj_unix}"
   # Ninja/cmd.exe linker prefers Windows mixed paths over /c/...
   if command -v cygpath >/dev/null 2>&1; then
@@ -370,12 +375,16 @@ configure() {
   local jobs; jobs="$(compute_jobs)"
   compile_msmpi_wrap "${BDIR}"
   local wrap_syms_cm; wrap_syms_cm="$(msmpi_wrap_syms_cmake)"
-  local inject_path
+  local inject_msmpi inject_fftlib inject_path
   if command -v cygpath >/dev/null 2>&1; then
-    inject_path="$(cygpath -m "${MSMPI_WRAP_INJECT}")"
+    inject_msmpi="$(cygpath -m "${MSMPI_WRAP_INJECT}")"
+    inject_fftlib="$(cygpath -m "${FFTLIB_WIN32_INJECT}")"
   else
-    inject_path="${MSMPI_WRAP_INJECT}"
+    inject_msmpi="${MSMPI_WRAP_INJECT}"
+    inject_fftlib="${FFTLIB_WIN32_INJECT}"
   fi
+  # Semicolon list: MS-MPI wrap + fftlib MinGW dlfcn RTLD_NOLOAD shim
+  inject_path="${inject_msmpi};${inject_fftlib}"
   # Re-apply optional env in case configure is invoked alone.
   source_toolchain_optional
   local cmake_prefix
@@ -389,6 +398,7 @@ configure() {
     -DCMAKE_C_COMPILER=gcc \
     -DCMAKE_PREFIX_PATH="${cmake_prefix}" \
     -DVASP_OPENMP=ON \
+    -DVASP_FFTLIB=ON \
     -DVASP_HDF5="${VASP_HDF5}" \
     -DVASP_LIBXC="${VASP_LIBXC}" \
     -DVASP_WANNIER90="${VASP_WANNIER90}" \
@@ -397,7 +407,7 @@ configure() {
     -DVASP_SHMEM=OFF \
     -DVASP_SYSV=OFF \
     -DVASP_TARGET_CPU="${TARGET_CPU}" \
-    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--stack,268435456" \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,--stack,268435456 -ldl" \
     -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${inject_path}" \
     -DVASP_MSMPI_WRAP_OBJ="${MSMPI_WRAP_OBJ}" \
     -DVASP_MSMPI_WRAP_SYMS="${wrap_syms_cm}" \
