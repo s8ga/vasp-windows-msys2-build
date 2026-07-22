@@ -61,6 +61,9 @@ VASP_OPENMP="${VASP_OPENMP:-ON}"
 # sentinel fix prevents the BSS corruption that previously damaged this lock.
 VASP_GOMP_CRITICAL_WIN32="${VASP_GOMP_CRITICAL_WIN32:-OFF}"
 # NUM_CORES — optional override for ninja -j (else RAM-capped nproc)
+# Materialize testsuite/POTCARS relative symlinks as real files after unpack
+# (Windows often fails to create those links; tar exits non-zero). Default ON.
+VASP_MATERIALIZE_POTCAR_LINKS="${VASP_MATERIALIZE_POTCAR_LINKS:-1}"
 
 #-----------------------------------------------------------------------------
 # Helpers
@@ -68,6 +71,114 @@ VASP_GOMP_CRITICAL_WIN32="${VASP_GOMP_CRITICAL_WIN32:-OFF}"
 log()  { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n'  "$*" >&2; }
 die()  { printf '\033[1;31m[err ]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Join dirname + relative target and collapse . / .. (no absolute, no drive).
+# Echoes normalized path relative to WORK_DIR / tarball root, or empty on failure.
+_norm_rel_path() {
+  local base="$1" rel="$2"
+  local IFS='/'
+  # shellcheck disable=SC2206
+  local parts=( ${base} )
+  local seg
+  case "${rel}" in
+    /*|[A-Za-z]:*) printf ''; return 1 ;;
+  esac
+  # shellcheck disable=SC2206
+  local segs=( ${rel} )
+  for seg in "${segs[@]}"; do
+    case "${seg}" in
+      ''|.) continue ;;
+      ..)
+        if [ "${#parts[@]}" -eq 0 ]; then printf ''; return 1; fi
+        unset "parts[-1]"
+        ;;
+      *) parts+=("${seg}") ;;
+    esac
+  done
+  if [ "${#parts[@]}" -eq 0 ]; then printf ''; return 1; fi
+  local out="${parts[0]}"
+  local i
+  for ((i = 1; i < ${#parts[@]}; i++)); do
+    out="${out}/${parts[i]}"
+  done
+  printf '%s' "${out}"
+}
+
+# After tar extract: copy relative testsuite/POTCARS symlink targets as real files.
+# Catalog comes from tar -tvf (not find -type l on disk). Skips absolute / dangling / cycles.
+materialize_potcar_links() {
+  case "${VASP_MATERIALIZE_POTCAR_LINKS}" in
+    0|false|FALSE|off|OFF|no|NO)
+      log "POTCAR link materialize skipped (VASP_MATERIALIZE_POTCAR_LINKS=${VASP_MATERIALIZE_POTCAR_LINKS})"
+      return 0
+      ;;
+  esac
+
+  local -A link_map=()
+  local line name target
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
+      l*"testsuite/POTCARS/"*" -> "*) ;;
+      *) continue ;;
+    esac
+    target="${line##* -> }"
+    name="${line%% -> *}"
+    name="${name##* }"
+    case "${name}" in
+      *testsuite/POTCARS/*) ;;
+      *) continue ;;
+    esac
+    case "${target}" in
+      ''|/*|[A-Za-z]:*) continue ;;
+    esac
+    link_map["${name}"]="${target}"
+  done < <(tar -tvf "${VASP_TARBALL}" 2>/dev/null || true)
+
+  local materialized=0 skipped=0
+  local cur nxt src dst dir visited hop
+  for name in "${!link_map[@]}"; do
+    cur="${name}"
+    visited=""
+    src=""
+    for ((hop = 0; hop < 32; hop++)); do
+      case " ${visited} " in
+        *" ${cur} "*) src=""; break ;;
+      esac
+      visited="${visited} ${cur}"
+      if [ -n "${link_map[${cur}]+x}" ]; then
+        target="${link_map[${cur}]}"
+        case "${target}" in
+          /*|[A-Za-z]:*) src=""; break ;;
+        esac
+        dir="$(dirname "${cur}")"
+        nxt="$(_norm_rel_path "${dir}" "${target}")" || { src=""; break; }
+        [ -n "${nxt}" ] || { src=""; break; }
+        cur="${nxt}"
+        continue
+      fi
+      # Not a catalogued symlink: treat as leaf path under WORK_DIR.
+      if [ -f "${WORK_DIR}/${cur}" ] && [ -s "${WORK_DIR}/${cur}" ]; then
+        src="${WORK_DIR}/${cur}"
+      else
+        src=""
+      fi
+      break
+    done
+
+    dst="${WORK_DIR}/${name}"
+    if [ -z "${src}" ] || [ ! -f "${src}" ] || [ ! -s "${src}" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    # Already a real non-empty copy of the same inode/size is fine; always refresh.
+    mkdir -p "$(dirname "${dst}")"
+    rm -f "${dst}"
+    cp -f "${src}" "${dst}"
+    materialized=$((materialized + 1))
+  done
+
+  log "materialized ${materialized} POTCAR link(s); skipped ${skipped} (absolute/dangling/cycle/empty)"
+}
 
 # Parse CLI: --develop / --help and optional tarball positional.
 parse_args() {
@@ -388,8 +499,8 @@ unpack() {
   mkdir -p "${WORK_DIR}"
   log "extracting ${VASP_TARBALL} ..."
   # On Windows, relative symlinks under testsuite/POTCARS often fail and make
-  # GNU tar exit non-zero. Those links are not required to compile VASP — keep
-  # going if src/ is present.
+  # GNU tar exit non-zero. Keep going if src/ is present; optionally materialize
+  # those POTCAR links as real file copies (default ON) so the testsuite can run.
   set +e
   tar -xf "${VASP_TARBALL}" -C "${WORK_DIR}"
   local tar_rc=$?
@@ -397,6 +508,7 @@ unpack() {
   if [ "${tar_rc}" -ne 0 ]; then
     warn "tar exited ${tar_rc} (often Windows symlink failures under testsuite/POTCARS); continuing if src/ exists"
   fi
+  materialize_potcar_links
 
   # locate the source root = directory containing src/
   SRC_ROOT="$(find "${WORK_DIR}" -maxdepth 2 -type d -name src -printf '%h\n' | head -1)"

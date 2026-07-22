@@ -23,7 +23,10 @@ here.
    `patches/0003-cmake-enable-dftd4.patch` to staged `CMakeLists_root.txt` so
    `-DVASP_DFTD4=ON` (pipeline default) can `find_package(DFTD4)`.
 2. Materialize `CMakeLists.txt` symlinks as real files so Windows CMake can
-   read them.
+   read them. After unpack, also materialize relative `testsuite/POTCARS/`
+   symlinks listed by `tar -tvf` as real `cp` copies (Windows often fails to
+   create those links); toggle with `VASP_MATERIALIZE_POTCAR_LINKS` (default
+   `1`).
 3. Apply Win32 / validation patches idempotently:
    - `0001` / `0002` — timing (`getrusage` → `GetProcessTimes`)
    - `0004` — MAXMEM auto-detect (`/proc/meminfo` → `GlobalMemoryStatusEx`;

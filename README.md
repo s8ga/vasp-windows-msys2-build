@@ -165,6 +165,7 @@ Stages (`release`): `preflight → unpack → setup → patch → configure → 
 | `MINGW_PREFIX`             | `/ucrt64`                    | Resolved with `pwd -P` (Scoop symlinks OK)                          |
 | `ALLOW_NON_UCRT64`         | *(unset)*                    | Set `1` to skip the UCRT64 hard gate                                |
 | `MSMPI_BIN`                | *(auto)*                     | Directory containing host `mpiexec.exe`                             |
+| `VASP_MATERIALIZE_POTCAR_LINKS` | `1`                     | After unpack, copy relative `testsuite/POTCARS/` symlink targets as real files (`0` to skip) |
 
 Runtime / testsuite (not CMake configure):
 
