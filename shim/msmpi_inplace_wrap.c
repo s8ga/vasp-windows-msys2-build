@@ -215,6 +215,51 @@ static int fix_buf(void **s_inout, const char *name)
   return 0;
 }
 
+/*
+ * Shared NULL / MPI_DATATYPE_NULL substitute for Fortran collectives.
+ * Does not write through the caller's datatype pointer (may be PARAMETER /
+ * r/o). Returns datatype unchanged, or dt_local_out filled with a substitute.
+ * Override: MSMPI_NULL_DT_FALLBACK=double|byte|none (default double_complex).
+ * count/op are optional debug context only (pass NULL when unused).
+ */
+static MPI_Fint *null_dt_fallback(
+    MPI_Fint *datatype, MPI_Fint *dt_local_out, const char *name,
+    MPI_Fint *count, MPI_Fint *op)
+{
+  const char *fb;
+  MPI_Fint dt_local;
+
+  if (!datatype ||
+      (*datatype != 0 && *datatype != (MPI_Fint)MPI_DATATYPE_NULL))
+    return datatype;
+
+  fb = getenv("MSMPI_NULL_DT_FALLBACK");
+  if (!fb || fb[0] == '\0' || strcmp(fb, "double_complex") == 0)
+    dt_local = (MPI_Fint)MPI_DOUBLE_COMPLEX;
+  else if (strcmp(fb, "double") == 0)
+    dt_local = (MPI_Fint)MPI_DOUBLE;
+  else if (strcmp(fb, "byte") == 0)
+    dt_local = (MPI_Fint)MPI_BYTE;
+  else
+    return datatype; /* none / unknown: keep NULL, let MPI error */
+
+  *dt_local_out = dt_local;
+  if (wrap_debug_enabled() && wrap_debug_rank0()) {
+    char buf[192];
+    if (op)
+      snprintf(buf, sizeof(buf),
+               "[wrap] %s: NULL datatype -> 0x%x (count=%d op=0x%x)\n", name,
+               (unsigned)dt_local, count ? (int)*count : -1,
+               (unsigned)*op);
+    else
+      snprintf(buf, sizeof(buf),
+               "[wrap] %s: NULL datatype -> 0x%x (count=%d)\n", name,
+               (unsigned)dt_local, count ? (int)*count : -1);
+    wrap_log_line(buf);
+  }
+  return dt_local_out;
+}
+
 /* Original MS-MPI Fortran stubs (provided by GNU ld --wrap). */
 void __real_mpi_allreduce_(
     void *sendbuf, void *recvbuf,
@@ -248,6 +293,9 @@ void __real_mpi_iallgather_(
     void *sendbuf, MPI_Fint *sendcount, MPI_Fint *sendtype,
     void *recvbuf, MPI_Fint *recvcount, MPI_Fint *recvtype,
     MPI_Fint *comm, MPI_Fint *request, MPI_Fint *ierr);
+void __real_mpi_bcast_(
+    void *buffer, MPI_Fint *count, MPI_Fint *datatype,
+    MPI_Fint *root, MPI_Fint *comm, MPI_Fint *ierr);
 void __real_mpi_waitall_(
     MPI_Fint *count, MPI_Fint *array_of_requests,
     MPI_Fint *array_of_statuses, MPI_Fint *ierr);
@@ -265,39 +313,30 @@ void __wrap_mpi_allreduce_(
 {
   int remapped = fix_buf(&sendbuf, "mpi_allreduce_");
   MPI_Fint dt_local;
-  MPI_Fint *dt_ptr = datatype;
+  MPI_Fint *dt_ptr;
   wrap_debug_handles("mpi_allreduce_", remapped, count, datatype, op, comm);
   /*
    * ACFDT (and similar) can call Fortran mpi_allreduce_ with a user MPI_Op
    * and MPI_DATATYPE_NULL on MS-MPI. MS-MPI rejects NULL even when the user
-   * reduction ignores the type. Prefer a local substitute (do not write through
-   * datatype — it may be a PARAMETER in r/o memory).
-   * Override: MSMPI_NULL_DT_FALLBACK=double|byte|none (default double_complex).
+   * reduction ignores the type. Shared null_dt_fallback substitutes locally.
    */
-  if (datatype &&
-      (*datatype == 0 || *datatype == (MPI_Fint)MPI_DATATYPE_NULL)) {
-    const char *fb = getenv("MSMPI_NULL_DT_FALLBACK");
-    if (!fb || fb[0] == '\0' || strcmp(fb, "double_complex") == 0)
-      dt_local = (MPI_Fint)MPI_DOUBLE_COMPLEX;
-    else if (strcmp(fb, "double") == 0)
-      dt_local = (MPI_Fint)MPI_DOUBLE;
-    else if (strcmp(fb, "byte") == 0)
-      dt_local = (MPI_Fint)MPI_BYTE;
-    else
-      dt_local = *datatype; /* none / unknown: keep NULL, let MPI error */
-    if (dt_local != *datatype) {
-      if (wrap_debug_enabled() && wrap_debug_rank0()) {
-        char buf[192];
-        snprintf(buf, sizeof(buf),
-                 "[wrap] mpi_allreduce_: NULL datatype -> 0x%x (count=%d op=0x%x)\n",
-                 (unsigned)dt_local, count ? (int)*count : -1,
-                 op ? (unsigned)*op : 0u);
-        wrap_log_line(buf);
-      }
-      dt_ptr = &dt_local;
-    }
-  }
+  dt_ptr = null_dt_fallback(datatype, &dt_local, "mpi_allreduce_", count, op);
   __real_mpi_allreduce_(sendbuf, recvbuf, count, dt_ptr, op, comm, ierr);
+}
+
+/*
+ * mpi_bcast_ has no IN_PLACE sendbuf — only NULL-dt fallback (same helper as
+ * allreduce). Seen on HEG_333_LW / SiC_ACFDTR_T / SiC8_GW0R with MS-MPI.
+ */
+void __wrap_mpi_bcast_(
+    void *buffer, MPI_Fint *count, MPI_Fint *datatype,
+    MPI_Fint *root, MPI_Fint *comm, MPI_Fint *ierr)
+{
+  MPI_Fint dt_local;
+  MPI_Fint *dt_ptr;
+  wrap_debug_handles("mpi_bcast_", 0, count, datatype, NULL, comm);
+  dt_ptr = null_dt_fallback(datatype, &dt_local, "mpi_bcast_", count, NULL);
+  __real_mpi_bcast_(buffer, count, dt_ptr, root, comm, ierr);
 }
 
 void __wrap_mpi_reduce_(
@@ -426,12 +465,15 @@ void __wrap_mpi_get_(
 /*
  * BLACS (inside MSYS2 libscalapack) default combine topology uses C
  * MPI_Allreduce + MPI_Op_create. On MS-MPI that path can abort with
- * MPI_DATATYPE_NULL (seen on multi-rank ACFDT; n=1 OK; Fortran mpi_*_
- * wraps never see count/op of the failing call).
+ * MPI_DATATYPE_NULL (seen historically on multi-rank ACFDT). Netlib BLACS:
+ * if ctxt->TopsRepeat != 0, gsum2d forces tree topology ('1') instead of
+ * MPI's reduction. SGET_TOPSREPEAT == 15 in Bdef.h.
  *
- * Netlib BLACS: if ctxt->TopsRepeat != 0, gsum2d forces tree topology
- * ('1') instead of MPI's reduction. SGET_TOPSREPEAT == 15 in Bdef.h.
- * Opt out: MSMPI_BLACS_TOPSREPEAT=0
+ * Default OFF: calling blacs_set_(TopsRepeat) after gridinit/gridmap can
+ * SIGSEGV inside libscalapack on some MLFF / BSE grids (bad/unready ctxt
+ * table entry). ACFDT multi-rank PASS is covered by the Fortran NULL-dt
+ * fallback on mpi_allreduce_/mpi_bcast_; TopsRepeat is only an optional
+ * extra. Opt in: MSMPI_BLACS_TOPSREPEAT=1
  */
 enum { BLACS_SGET_TOPSREPEAT = 15 };
 
@@ -451,7 +493,12 @@ static void blacs_force_tops_repeat(MPI_Fint *ConTxt)
   MPI_Fint val = 1;
   MPI_Fint got = -999;
   FILE *fp;
-  if (env && (env[0] == '0') && env[1] == '\0')
+  /* Default off: unset / empty / "0" skip. Only explicit "1" enables. */
+  if (!env || env[0] == '\0' || env[0] == '0')
+    return;
+  if (env[0] != '1' || env[1] != '\0')
+    return;
+  if (!ConTxt || *ConTxt < 0)
     return;
   blacs_set_(ConTxt, &what, &val);
   blacs_get_(ConTxt, &what, &got);

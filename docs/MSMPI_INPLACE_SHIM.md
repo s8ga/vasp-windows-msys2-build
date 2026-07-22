@@ -114,8 +114,8 @@ Default symbol list (`MSMPI_WRAP_SYMS`, space-separated in the shell):
 
 ```text
 mpi_allreduce_ mpi_reduce_ mpi_allgather_ mpi_allgatherv_
-mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_waitall_
-mpi_get_ blacs_gridinit_ blacs_gridmap_
+mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_bcast_
+mpi_waitall_ mpi_get_ blacs_gridinit_ blacs_gridmap_
 ```
 
 Override with `MSMPI_WRAP_SYMS='...'` if `nm` on `vasp_std.exe` shows more
@@ -179,16 +179,16 @@ Only the Fortran stub names listed in `MSMPI_WRAP_SYMS` are intercepted.
 - `mpi_allreduce_`, `mpi_reduce_`
 - `mpi_allgather_`, `mpi_allgatherv_`, `mpi_gather_`
 - `mpi_alltoall_`, `mpi_alltoallv_`, `mpi_iallgather_`
+- `mpi_bcast_` (NULL-dt fallback only; no IN_PLACE sendbuf)
 - `mpi_waitall_` (`MPI_STATUSES_IGNORE` via `/MPIPRIV2/`)
 - `mpi_get_` (RMA origin may use `MPI_BOTTOM`)
 
 **Not wrapped by default** (non-exhaustive): other collectives / RMA /
-neighborhood collectives (`mpi_bcast_` is usually fine without inplace;
-`mpi_scatter*`, `mpi_reduce_scatter*`, `mpi_put_`, `mpi_accumulate_`,
-nonblocking variants beyond `iallgather`, etc.). If a future workload crashes
-or disagrees across rank counts, inspect Fortran MPI stubs with `nm` and extend
-`MSMPI_WRAP_SYMS` plus matching `__wrap_*` / `__real_*` declarations in
-`shim/msmpi_inplace_wrap.c`.
+neighborhood collectives (`mpi_scatter*`, `mpi_reduce_scatter*`, `mpi_put_`,
+`mpi_accumulate_`, nonblocking variants beyond `iallgather` / blocking
+`bcast`, etc.). If a future workload crashes or disagrees across rank counts,
+inspect Fortran MPI stubs with `nm` and extend `MSMPI_WRAP_SYMS` plus matching
+`__wrap_*` / `__real_*` declarations in `shim/msmpi_inplace_wrap.c`.
 
 Other limits:
 
@@ -233,18 +233,19 @@ Independent failure classes on the same FAST portable. Do **not** conflate them:
 
 | Track | Typical recipes | Symptom | What helps |
 | --- | --- | --- | --- |
-| **MPI / ACFDT (NULL dt)** | `bulk_GaAs_ACFDT` (+ related ACFDT/GW reduce paths) | `MPI_Allreduce` abort with **`MPI_DATATYPE_NULL`** | This shim: IN_PLACE remap + NULL-dt fallback (+ optional BLACS TopsRepeat) |
+| **MPI / ACFDT (NULL dt)** | `bulk_GaAs_ACFDT`, `HEG_333_LW`, `SiC_ACFDTR_T`, `SiC8_GW0R` (+ related ACFDT/GW paths) | `MPI_Allreduce` / `MPI_Bcast` abort with **`MPI_DATATYPE_NULL`** | This shim: IN_PLACE remap + shared NULL-dt fallback on `mpi_allreduce_` / `mpi_bcast_` (BLACS TopsRepeat is optional opt-in only) |
+| **BLACS TopsRepeat SEGV** | `LiH_MLFF_8atoms`, `C8_no_symm_BSE` (n≥2) | SIGSEGV in `libscalapack` via `__wrap_blacs_gridinit_` / `gridmap_` → `blacs_set_(TopsRepeat)` when TopsRepeat was forced by default | **Default: TopsRepeat off** (unset/`0`). Opt in with `MSMPI_BLACS_TOPSREPEAT=1` only for diagnosis; ACFDT n=4 PASS does **not** require it |
 | **MPI / WAITALL (`/MPIPRIV2/`)** | `bulk_BN_PBE0` (and other multi-request wait paths) | SIGSEGV in `GOMP_critical_name_start` → `libwinpthread`, or wrong forces/stress after SRW-only workaround | `__wrap_mpi_waitall_` + `__imp_mpipriv2_` remap (see above). **Not** fixed by NULL-dt fallback or FFTW omp↔threads alone |
 | **FFT hygiene (secondary)** | hybrid OpenMP jobs | Planner / thread-pool noise | FFTW planner ctor + pins — see below; useful but **not** the PBE0 n4 root cause |
 
 ---
 
-## Further mitigation: NULL datatype on ACFDT (2026-07-21)
+## Further mitigation: NULL datatype on ACFDT / Bcast (2026-07-21)
 
 This is a **runtime mitigation**, not an upstream root-cause fix. The caller
-still passes `MPI_DATATYPE_NULL` into Fortran `mpi_allreduce_` on multi-rank
-ACFDT; the wrap substitutes a usable MS-MPI datatype so the collective can
-complete.
+still passes `MPI_DATATYPE_NULL` into Fortran `mpi_allreduce_` and/or
+`mpi_bcast_` on some multi-rank ACFDT / HEG / SiC paths; the wrap substitutes a
+usable MS-MPI datatype so the collective can complete.
 
 ### Evidence (debug — do not re-guess)
 
@@ -265,17 +266,25 @@ once the Fortran NULL-dt case is handled, it was not the ACFDT abort.
 ### Mitigation mechanism
 
 1. **IN_PLACE remap** (existing): local gfortran `/MPIPRIV1/` → MS-MPI DLL `mpipriv1_`.
-2. **NULL / `MPI_DATATYPE_NULL` fallback** on `__wrap_mpi_allreduce_` only: if
-   `*datatype` is `0` or `MPI_DATATYPE_NULL`, pass a **local** substitute handle
-   into `__real_mpi_allreduce_` (does **not** write through the caller’s
-   pointer). Default substitute: Fortran `MPI_DOUBLE_COMPLEX`.
+2. **NULL / `MPI_DATATYPE_NULL` fallback** via shared `null_dt_fallback()` on
+   `__wrap_mpi_allreduce_` and `__wrap_mpi_bcast_`: if `*datatype` is `0` or
+   `MPI_DATATYPE_NULL`, pass a **local** substitute handle into `__real_mpi_*_`
+   (does **not** write through the caller’s pointer). `mpi_bcast_` has no
+   IN_PLACE sendbuf — only this NULL-dt path. Default substitute: Fortran
+   `MPI_DOUBLE_COMPLEX`.
    - Env: `MSMPI_NULL_DT_FALLBACK=double|byte|none`
    - `double` → `MPI_DOUBLE_PRECISION`; `byte` → `MPI_BYTE`; `none` keeps NULL
      (MS-MPI will still error — useful to confirm the mitigation is required).
-3. **Optional BLACS TopsRepeat**: `--wrap=blacs_gridinit_` / `blacs_gridmap_`
-   then `blacs_set_(ctxt, 15, 1)` so BLACS `gsum2d` prefers tree topology.
-   Default wrap list in `build_pipeline.sh` includes these symbols. Opt out:
-   `MSMPI_BLACS_TOPSREPEAT=0`.
+3. **Optional BLACS TopsRepeat (default OFF)**: `--wrap=blacs_gridinit_` /
+   `blacs_gridmap_` may call `blacs_set_(ctxt, 15, 1)` so BLACS `gsum2d`
+   prefers tree topology (avoids some BLACS C `MPI_Allreduce` +
+   `MPI_DATATYPE_NULL` paths). **Default is off** (unset / `0` / empty).
+   Historically, forcing TopsRepeat after every grid init/map SIGSEGV’d inside
+   `libscalapack` on MLFF / BSE (stack: `blacs_force_tops_repeat` →
+   `blacs_set_`). Opt in only for diagnosis: `MSMPI_BLACS_TOPSREPEAT=1`
+   (writes `msmpi_blacs_tops_repeat.log` when applied). Invalid / negative
+   `ctxt` is skipped even when opted in. ACFDT multi-rank PASS relies on the
+   NULL-dt fallback above, not on TopsRepeat (confirmed n=4 with default off).
 
 ### How to enable debug
 
@@ -296,35 +305,58 @@ Look for:
 
 - `[wrap] mpi_allreduce_: fake → DLL mpipriv1` (rate-limited at level 1)
 - `[wrap] mpi_allreduce_: NULL datatype -> 0x... (count=... op=...)`
+- `[wrap] mpi_bcast_: NULL datatype -> 0x... (count=...)`
 - `[wrap] mpi_waitall_: ... (DLL mpipriv2)` (rate-limited at level 1)
-- optional `[wrap] blacs TopsRepeat set=1 ...`
+- optional `[wrap] blacs TopsRepeat set=1 ...` (only if `MSMPI_BLACS_TOPSREPEAT=1`)
 
 ### Limits / risks
 
 - **Not a root-cause fix**: something upstream still hands `MPI_DATATYPE_NULL`
-  into Allreduce with a user `MPI_Op` on multi-rank ACFDT. The shim only
-  unblocks MS-MPI so validation can proceed.
+  into Allreduce (user `MPI_Op`) and/or Bcast on multi-rank ACFDT / HEG / SiC
+  paths. The shim only unblocks MS-MPI so validation can proceed.
 - Fallback assumes the buffer layout matches the chosen substitute
   (`MPI_DOUBLE_COMPLEX` by default). Wrong size/type could corrupt memory or
   yield wrong energies — treat PASS as “validated for known recipes”, not a
   proof of general correctness for every NULL-dt call site.
-- Only `mpi_allreduce_` applies the NULL-dt fallback today; other collectives
-  still only remap IN_PLACE/BOTTOM.
+- NULL-dt fallback applies to `mpi_allreduce_` and `mpi_bcast_` today; other
+  collectives still only remap IN_PLACE/BOTTOM (where applicable).
+  `mpi_ibcast_` is **not** wrapped unless a future log shows that path.
 - Older portable ZIPs without this wrap object remain broken on multi-rank
-  ACFDT; rebuild / copy a current `vasp_std.exe` into the portable `bin/`.
+  ACFDT / HEG / SiC Bcast; rebuild / copy a current `vasp_std.exe` into the
+  portable `bin/`.
 
-### Related open item (not fixed by Allreduce fallback)
+### Bcast NULL-dt (closed 2026-07-21)
 
-Retests on the same portable (2026-07-21) show **HEG_333_LW**, **SiC_ACFDTR_T**, and **SiC8_GW0R** still abort with **MPI_Bcast + MPI_DATATYPE_NULL** (not mpi_allreduce_). The current NULL-dt substitute applies only inside __wrap_mpi_allreduce_; extending a similar fallback to mpi_bcast_ (or fixing the upstream NULL handle) is future work and separate from the ACFDT Allreduce mitigation.
+Previously open: **HEG_333_LW**, **SiC_ACFDTR_T**, **SiC8_GW0R** aborted with
+**MPI_Bcast + MPI_DATATYPE_NULL**. Closed by extending the shared
+`null_dt_fallback` helper to `__wrap_mpi_bcast_` and adding `mpi_bcast_` to
+`MSMPI_WRAP_SYMS` (same default-type assumption / risk as Allreduce; still a
+mitigation, not an upstream root-cause fix). Companion history:
+[MSYS2_MSMPI_MULTIRANK.md](MSYS2_MSMPI_MULTIRANK.md).
 
+**Verification (develop relink, unset `MSMPI_WRAP_DEBUG`):**
+
+| Recipe | Result |
+|---|---|
+| `HEG_333_LW` | **PASS** |
+| `SiC_ACFDTR_T` | **PASS** |
+| `SiC8_GW0R` | **PASS** |
+| `bulk_GaAs_ACFDT` (regression) | **PASS** |
+| `bulk_BN_PBE0` (regression) | **PASS** |
+
+**WRAP_DEBUG smoke (`MSMPI_WRAP_DEBUG=1`, `HEG_333_LW`):** **PASS**; ~11k readable
+lines (not million-line char garble); includes
+`[wrap] mpi_bcast_: NULL datatype -> ...` and allreduce NULL-dt lines.
 
 ### Confirmed status (uncommitted)
 
 - `bulk_GaAs_ACFDT` at default FAST ranks (**n=4**): **PASS** (IN_PLACE + NULL-dt
-  path; still true after WAITALL wrap).
+  path; still true after WAITALL + Bcast wraps).
 - `bulk_BN_PBE0` at **n=4**: **PASS** energy/forces/stress with
   `__wrap_mpi_waitall_` + `__imp_mpipriv2_` remap and **native GOMP**
   (`VASP_GOMP_CRITICAL_WIN32=OFF`).
+- `HEG_333_LW` / `SiC_ACFDTR_T` / `SiC8_GW0R`: **PASS** after `__wrap_mpi_bcast_`
+  NULL-dt fallback (`nm` shows `__wrap_mpi_bcast_` / `null_dt_fallback`).
 - Changes live in `shim/msmpi_inplace_wrap.c` + `build_pipeline.sh` wrap list /
   GOMP default; **not committed** at the time of this note.
 

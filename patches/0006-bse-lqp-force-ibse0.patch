@@ -1,0 +1,22 @@
+--- a/src/bse.F
++++ b/src/bse.F
+@@ -310,10 +310,19 @@ CONTAINS
+        FAST_CYCLE=.FALSE.
+        MULTIPLY_FRACTIONAL_OCC=.FALSE.
+        LCORBSE=.FALSE.
+        LTRIANGLE=.FALSE.
+        LHEAD_DIRECT=.TRUE.
++       ! Win32/MSYS2: chi_glb default IBSE=2 selects the *new* BSE driver for
++       ! ordinary BSE. QPBSE still enters this old CALCULATE_BSE path, which
++       ! only allocates AMAT/AVpW and runs SELFEN when IBSE==0 (matches
++       ! OUTCAR.QPBSE.ref). Leaving IBSE=2 skips allocation then crashes on
++       ! DEALLOCATE(AMAT) / unallocated zeroing (N_GW QPBSE).
++       IF (IBSE /= 0) THEN
++          IF (IO%IU0>=0) WRITE(IO%IU0,*) 'QPBSE/LQP: forcing IBSE=0 (old matrix driver)'
++          IBSE=0
++       ENDIF
+     ENDIF
+ !=======================================================================
+ ! somewhat akward: the routine can solve the BSE equation
+ ! at various Coulomb couplings in the list ALPHAV(1:NALPHA)
+ ! this allows to perform a coupling constant integration to obtain

@@ -1,0 +1,22 @@
+--- a/src/bse.F
++++ b/src/bse.F
+@@ -752,12 +752,17 @@ CONTAINS
+ !==========================================================================
+     IF (ALLOCATED(VMAT)) VMAT=0
+     IF (ALLOCATED(VMAT_SCALA)) VMAT_SCALA=0
+ 
+     IF (LQP) THEN
+-       AVpW=0; AVpW_SCALA=0
+-       BVpW=0; BVpW_SCALA=0
++       ! Win32/MS-MPI: LQP zeroing may run when arrays were never allocated
++       ! (wrong branch / ANIRES); mirror VMAT ALLOCATED guards to avoid
++       ! memset(NULL,...) SIGSEGV (N_GW QPBSE).
++       IF (ALLOCATED(AVpW)) AVpW=0
++       IF (ALLOCATED(AVpW_SCALA)) AVpW_SCALA=0
++       IF (ALLOCATED(BVpW)) BVpW=0
++       IF (ALLOCATED(BVpW_SCALA)) BVpW_SCALA=0
+     ENDIF
+ !==========================================================================
+ ! loop over coupling constant integration points alpha
+     SUM_ALPHA=0.0
+ ccintegration: DO IALPHA=1,NALPHA

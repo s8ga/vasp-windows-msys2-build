@@ -18,7 +18,7 @@
 #
 # Co-located assets (relative to this script):
 #   ./vasp_cmake/        official CMake port (setup.sh, CMakeLists/, Find*.cmake)
-#   ./patches/           0001/0002 timing + 0003 DFTD4 + 0004 Win32 MAXMEM
+#   ./patches/           0001/0002 timing + 0003 DFTD4 + 0004 Win32 MAXMEM + 0005 BSE AVpW
 #   ./shim/              MS-MPI wrap, FFTW, Win32 available-memory helper
 #   ./cmake_overlays/    FindDFTD4.cmake / FindLibXC.cmake (copied into staged cmake/)
 #   ./toolchain/install/ self-built HDF5/LibXC/Wannier90/DFTD4 (via install/setup)
@@ -456,17 +456,22 @@ setup() {
 }
 
 #-----------------------------------------------------------------------------
-# [3] patch — apply Win32 timing + MAXMEM patches (idempotent)
+# [3] patch — apply Win32 timing + MAXMEM + BSE AVpW guards (idempotent)
 #-----------------------------------------------------------------------------
 patch_sources() {
-  stage 3 "patch (dclock_/timing_ Win32 + AUTOSET MAXMEM)"
+  stage 3 "patch (dclock_/timing_ Win32 + AUTOSET MAXMEM + BSE AVpW/IBSE)"
   # explicit file -> patch mapping (robust; no name guessing)
   # marker: substring already present => skip (idempotent)
   local entries=(
     "src/lib/dclock_.c|${PATCH_DIR}/0001-dclock_-win32-getrusage.patch|win32_filetime_to_sec"
     "src/lib/timing_.c|${PATCH_DIR}/0002-timing_-win32-getrusage.patch|win32_filetime_to_sec"
     "src/ini.F|${PATCH_DIR}/0004-autoset-available-memory-win32.patch|vasp_win32_available_memory_kb"
+    "src/bse.F|${PATCH_DIR}/0005-bse-guard-avpw-zeroing.patch|IF (ALLOCATED(AVpW)) AVpW=0"
+    "src/bse.F|${PATCH_DIR}/0006-bse-lqp-force-ibse0.patch|QPBSE/LQP: forcing IBSE=0"
   )
+  # Unified diffs (diff -u / git diff). Use -l (ignore whitespace) so Fortran
+  # indent/spacing drift does not break apply; still idempotent via markers.
+  local patch_flags=(--forward -l -p1)
   local entry f p marker rest
   for entry in "${entries[@]}"; do
     f="${entry%%|*}"; rest="${entry#*|}"
@@ -475,15 +480,19 @@ patch_sources() {
     if grep -q "${marker}" "${SRC_ROOT}/${f}" 2>/dev/null; then
       log "already patched: $f"; continue
     fi
-    if patch --dry-run --forward -p1 -d "${SRC_ROOT}" < "$p" >/dev/null 2>&1; then
-      patch --forward -p1 -d "${SRC_ROOT}" < "$p" && log "applied $(basename "$p") -> $f"
+    if patch --dry-run "${patch_flags[@]}" -d "${SRC_ROOT}" < "$p" >/dev/null 2>&1; then
+      patch "${patch_flags[@]}" -d "${SRC_ROOT}" < "$p" && log "applied $(basename "$p") -> $f"
     else
       warn "patch not clean (maybe applied): $(basename "$p")"
+      # Show reject hint once for triage (still non-fatal until marker check)
+      patch --dry-run "${patch_flags[@]}" -d "${SRC_ROOT}" < "$p" 2>&1 | tail -n 20 || true
     fi
   done
   grep -q "win32_filetime_to_sec" "${SRC_ROOT}/src/lib/dclock_.c" || die "dclock_.c patch not active"
   grep -q "win32_filetime_to_sec" "${SRC_ROOT}/src/lib/timing_.c" || die "timing_.c patch not active"
   grep -q "vasp_win32_available_memory_kb" "${SRC_ROOT}/src/ini.F" || die "ini.F Win32 MAXMEM patch not active"
+  grep -q "IF (ALLOCATED(AVpW)) AVpW=0" "${SRC_ROOT}/src/bse.F" || die "bse.F AVpW ALLOCATED guard patch not active"
+  grep -q "QPBSE/LQP: forcing IBSE=0" "${SRC_ROOT}/src/bse.F" || die "bse.F LQP IBSE=0 force patch not active"
 }
 
 #-----------------------------------------------------------------------------
@@ -503,9 +512,9 @@ WIN32_MEM_INJECT="${WIN32_MEM_INJECT:-${SCRIPT_DIR}/shim/cmake_win32_mem_inject.
 GOMP_CRITICAL_WIN32_SRC="${GOMP_CRITICAL_WIN32_SRC:-${SCRIPT_DIR}/shim/gomp_critical_win32.c}"
 GOMP_CRITICAL_WIN32_INJECT="${GOMP_CRITICAL_WIN32_INJECT:-${SCRIPT_DIR}/shim/cmake_gomp_critical_win32_inject.cmake}"
 # Symbols discovered via nm on vasp_std (collectives / RMA that may see IN_PLACE or BOTTOM)
-# Also wrap BLACS grid init to set TopsRepeat (avoid BLACS C MPI_Allreduce
-# DATATYPE_NULL on MS-MPI; see docs/MSMPI_INPLACE_SHIM.md).
-MSMPI_WRAP_SYMS="${MSMPI_WRAP_SYMS:-mpi_allreduce_ mpi_reduce_ mpi_allgather_ mpi_allgatherv_ mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_waitall_ mpi_get_ blacs_gridinit_ blacs_gridmap_}"
+# Also wrap BLACS grid init/map: optional TopsRepeat (default off; opt in via
+# MSMPI_BLACS_TOPSREPEAT=1). See docs/MSMPI_INPLACE_SHIM.md.
+MSMPI_WRAP_SYMS="${MSMPI_WRAP_SYMS:-mpi_allreduce_ mpi_reduce_ mpi_allgather_ mpi_allgatherv_ mpi_gather_ mpi_alltoall_ mpi_alltoallv_ mpi_iallgather_ mpi_bcast_ mpi_waitall_ mpi_get_ blacs_gridinit_ blacs_gridmap_}"
 
 msmpi_wrap_syms_cmake() { # semicolon-separated list for CMake cache
   local s out=""
