@@ -5,6 +5,8 @@ English reference for the **fix** shipped in this repo for MSYS2 UCRT64
 proprietary VASP source is discussed here.
 
 Companion history / probes: [MSYS2_MSMPI_MULTIRANK.md](MSYS2_MSMPI_MULTIRANK.md).
+BSE / QPBSE Fortran guards (separate from this shim):
+[BSE_WIN32_GUARDS.md](BSE_WIN32_GUARDS.md).
 Packaging overview: [README.md](../README.md).
 
 ---
@@ -182,6 +184,7 @@ Only the Fortran stub names listed in `MSMPI_WRAP_SYMS` are intercepted.
 - `mpi_bcast_` (NULL-dt fallback only; no IN_PLACE sendbuf)
 - `mpi_waitall_` (`MPI_STATUSES_IGNORE` via `/MPIPRIV2/`)
 - `mpi_get_` (RMA origin may use `MPI_BOTTOM`)
+- `blacs_gridinit_`, `blacs_gridmap_` (optional TopsRepeat; **default OFF**)
 
 **Not wrapped by default** (non-exhaustive): other collectives / RMA /
 neighborhood collectives (`mpi_scatter*`, `mpi_reduce_scatter*`, `mpi_put_`,
@@ -348,7 +351,7 @@ mitigation, not an upstream root-cause fix). Companion history:
 lines (not million-line char garble); includes
 `[wrap] mpi_bcast_: NULL datatype -> ...` and allreduce NULL-dt lines.
 
-### Confirmed status (uncommitted)
+### Confirmed status
 
 - `bulk_GaAs_ACFDT` at default FAST ranks (**n=4**): **PASS** (IN_PLACE + NULL-dt
   path; still true after WAITALL + Bcast wraps).
@@ -358,7 +361,10 @@ lines (not million-line char garble); includes
 - `HEG_333_LW` / `SiC_ACFDTR_T` / `SiC8_GW0R`: **PASS** after `__wrap_mpi_bcast_`
   NULL-dt fallback (`nm` shows `__wrap_mpi_bcast_` / `null_dt_fallback`).
 - Changes live in `shim/msmpi_inplace_wrap.c` + `build_pipeline.sh` wrap list /
-  GOMP default; **not committed** at the time of this note.
+  GOMP default (`OFF`).
+
+QPBSE / `N_GW` Win32 guards (`0005` / `0006`) are separate Fortran patches —
+see [BSE_WIN32_GUARDS.md](BSE_WIN32_GUARDS.md).
 
 ### OpenMP / hybrid notes (PBE0, 2026-07-21)
 

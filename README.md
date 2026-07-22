@@ -23,7 +23,9 @@ binaries.** You must provide your own licensed VASP tarball outside this repo.
 | `build_pipeline.sh`   | **Single source of truth** — one-command driver (preflight → zip)  |
 | `toolchain/`          | Thin English entry points (deps / env / call pipeline / testsuite) |
 | `testsuite_overlays/` | MS-MPI fast/all conf overlays copied into extracted `testsuite/`   |
-| `patches/`            | Win32 timing + MAXMEM (`/proc/meminfo` → WinAPI) patches           |
+| `patches/`            | Win32 timing + MAXMEM + DFTD4 CMake enable + BSE/QPBSE guards      |
+| `cmake_overlays/`     | `FindDFTD4.cmake` / `FindLibXC.cmake` copied into staged `cmake/`  |
+| `shim/`               | MS-MPI `--wrap`, FFTW planner, Win32 MAXMEM, optional GOMP SRW     |
 | `vasp_cmake/`         | Official VASP CMake port (**git submodule**)                       |
 
 
@@ -149,19 +151,30 @@ Stages (`release`): `preflight → unpack → setup → patch → configure → 
 ### Tunables
 
 
-| Variable              | Default                      | Purpose                                                             |
-| --------------------- | ---------------------------- | ------------------------------------------------------------------- |
-| `VASP_TARBALL`        | `$1`                         | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
-| `VASP_PIPELINE_MODE`  | `release`                    | `release` (ZIP) or `develop` (rebuild only; no unpack wipe)         |
-| `TARGET_CPU`          | `x86-64`                     | CPU baseline (`-march=`); use `native` for local speed              |
-| `NUM_CORES`           | *(unset)*                    | Override ninja `-j` (else RAM-capped `nproc`)                       |
-| `BUILD_VARIANTS`      | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle                                              |
-| `PKG_NAME`            | `vasp-6.6.0-msys2-portable`  | Artifact name                                                       |
-| `MINGW_PREFIX`        | `/ucrt64`                    | Resolved with `pwd -P` (Scoop symlinks OK)                          |
-| `ALLOW_NON_UCRT64`    | *(unset)*                    | Set `1` to skip the UCRT64 hard gate                                |
-| `MSMPI_BIN`           | *(auto)*                     | Directory containing host `mpiexec.exe`                             |
+| Variable                   | Default                      | Purpose                                                             |
+| -------------------------- | ---------------------------- | ------------------------------------------------------------------- |
+| `VASP_TARBALL`             | `$1`                         | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
+| `VASP_PIPELINE_MODE`       | `release`                    | `release` (ZIP) or `develop` (rebuild only; no unpack wipe)         |
+| `VASP_HDF5` / `VASP_LIBXC` / `VASP_WANNIER90` / `VASP_DFTD4` | `ON` | Optional features (`DFTD4` needs `cmake_overlays/` + `0003`) |
+| `VASP_OPENMP` / `VASP_FFTLIB` | `ON`                      | OpenMP / internal fftlib                                            |
+| `VASP_GOMP_CRITICAL_WIN32` | `OFF`                        | Diagnostic SRW lock for one named GOMP critical — keep **OFF**      |
+| `TARGET_CPU`               | `x86-64`                     | CPU baseline (`-march=`); use `native` for local speed              |
+| `NUM_CORES`                | *(unset)*                    | Override ninja `-j` (else RAM-capped `nproc`)                       |
+| `BUILD_VARIANTS`           | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle                                              |
+| `PKG_NAME`                 | `vasp-6.6.0-msys2-portable`  | Artifact name                                                       |
+| `MINGW_PREFIX`             | `/ucrt64`                    | Resolved with `pwd -P` (Scoop symlinks OK)                          |
+| `ALLOW_NON_UCRT64`         | *(unset)*                    | Set `1` to skip the UCRT64 hard gate                                |
+| `MSMPI_BIN`                | *(auto)*                     | Directory containing host `mpiexec.exe`                             |
 
+Runtime / testsuite (not CMake configure):
 
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MSMPI_WRAP_DEBUG` | unset/`0` = off | Wrap tracing: `1` = rank-0 rate-limited; `2` = every call. Overlay forwards via `mpiexec -env` |
+| `MSMPI_BLACS_TOPSREPEAT` | unset/`0` = **OFF** | Opt-in BLACS TopsRepeat after `gridinit`/`gridmap` (diagnostic only) |
+| `VASP_TESTSUITE_NRANKS` | `4` | MPI ranks for `toolchain/run_testsuite.sh` overlays |
+
+Full MS-MPI shim notes: [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md).
 For a stage-by-stage walkthrough, see [STEP_BY_STEP.md](STEP_BY_STEP.md).
 
 ---
@@ -238,9 +251,17 @@ What the runner does:
 2. Copies `testsuite_overlays/msys2_msmpi_{fast,all}.conf` into that directory
 3. Builds `compare_numbertable_new` (gfortran) into `${TESTSUITE_ROOT}/tools/`
 4. Sets `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, and `PATH` for the
-   portable `bin/`; exports positional recipe names as `VASP_TESTSUITE_TESTS`
+   portable `bin/`; defaults `VASP_TESTSUITE_NRANKS=4`; exports positional
+   recipe names as `VASP_TESTSUITE_TESTS`
 5. Runs `./runtest msys2_msmpi_fast.conf` or `msys2_msmpi_all.conf` **with the
    config file only** (MS-MPI `mpiexec` + `vasp_{std,gam,ncl}.exe`)
+
+Optional env the overlays forward (when set and not `0`): `MSMPI_WRAP_DEBUG`
+via `mpiexec -env`. Other upstream-recognized vars (for example
+`SKIP_WAN90`, if your licensed `./runtest` honors it) are **not** special-cased
+by this repo — export them in the shell before `run_testsuite.sh` and they
+pass through the process environment unchanged. This runner does not implement
+extra skip logic of its own.
 
 Never run two `run_testsuite.sh` / `--fast` instances concurrently.
 
@@ -250,24 +271,30 @@ Never run two `run_testsuite.sh` / `--fast` instances concurrently.
 
 ## 4. What we patch (and why)
 
-**Timing (`src/lib/dclock_.c`, `src/lib/timing_.c`):** MinGW-w64 does not provide
-`getrusage()`; the patches use `GetProcessTimes()` instead. This affects OUTCAR
-timing/resource statistics only — not the physics.
+| Patch | Target | Why |
+| --- | --- | --- |
+| `0001` / `0002` | `src/lib/dclock_.c`, `timing_.c` | MinGW-w64 has no `getrusage()` → `GetProcessTimes()` (OUTCAR timing only) |
+| `0003` | staged `cmake/.../CMakeLists_root.txt` | Enable `-DVASP_DFTD4=ON` (`find_package(DFTD4)`); applied when staging CMake, with `cmake_overlays/FindDFTD4.cmake` |
+| `0004` | `src/ini.F` | MAXMEM auto-detect: no `/proc/meminfo` on native PE → WinAPI helper. See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md) |
+| `0005` | `src/bse.F` | QPBSE/LQP: zero `AVpW*` / `BVpW*` only if `ALLOCATED` (avoid NULL memset). See [docs/BSE_WIN32_GUARDS.md](docs/BSE_WIN32_GUARDS.md) |
+| `0006` | `src/bse.F` | QPBSE/LQP: force `IBSE=0` (old matrix driver) so `AMAT`/`AVpW` allocate. Same doc |
 
-**MAXMEM auto-detect (`src/ini.F`):** Native Windows PE has no `/proc/meminfo`,
-so upstream `AUTOSET_AVAILABLE_MEMORY` would keep the default 2800 MB and emit a
-tutor alert. A small C helper (`shim/win32_available_memory.c`) uses
-`GlobalMemoryStatusEx`; the Fortran path falls back to it when `/proc/meminfo`
-is missing. Semantics (≈90% of available RAM, per-rank split, MPI min across
-nodes) are unchanged. See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md).
+Patches in `patches/` are applied **idempotently**. `0003` runs during CMake
+staging; `0001`/`0002`/`0004`/`0005`/`0006` run in stage **patch**.
 
-Patches live in `patches/` and are applied idempotently.
+**MS-MPI linker shim (not a Fortran patch):** `shim/msmpi_inplace_wrap.c`
+remaps fake gfortran `MPI_IN_PLACE` / `MPI_STATUSES_IGNORE` sentinels, adds
+NULL-datatype fallback on `mpi_allreduce_` / `mpi_bcast_`, and optionally wraps
+BLACS grid init/map (**TopsRepeat default OFF**). GOMP SRW
+(`VASP_GOMP_CRITICAL_WIN32`) defaults **OFF**. Details:
+[docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md).
 
 Everything else uses official CMake options (`VASP_OPENMP=ON`, `VASP_FFTLIB=ON`
-with FFTW, `VASP_SHMEM=OFF`, `VASP_SYSV=OFF`, `VASP_TARGET_CPU`,
-`BLA_VENDOR=OpenBLAS`, explicit MPI Fortran hints). On MinGW, fftlib needs
-pacman `dlfcn` plus a tiny CMake inject (`shim/cmake_fftlib_win32_inject.cmake`)
-that defines missing `RTLD_NOLOAD` — no System-V shared memory.
+with FFTW, `VASP_DFTD4=ON`, `VASP_SHMEM=OFF`, `VASP_SYSV=OFF`,
+`VASP_TARGET_CPU`, `BLA_VENDOR=OpenBLAS`, explicit MPI Fortran hints). On
+MinGW, fftlib needs pacman `dlfcn` plus a tiny CMake inject
+(`shim/cmake_fftlib_win32_inject.cmake`) that defines missing `RTLD_NOLOAD` —
+no System-V shared memory.
 
 ---
 

@@ -86,9 +86,14 @@ echo "SRC_ROOT=$SRC_ROOT"
 
 rm -rf "$SRC_ROOT/cmake"
 cp -a "$VASP_CMAKE_DIR" "$SRC_ROOT/cmake"
+
+# Overlays + DFTD4 enable (pipeline does this in unpack; do the same manually):
+cp -f "$DELIV/cmake_overlays/"*.cmake "$SRC_ROOT/cmake/"
+patch --forward -p1 -d "$SRC_ROOT" < "$PATCH_DIR/0003-cmake-enable-dftd4.patch" || true
 ```
 
-**Checkpoint:** `ls "$SRC_ROOT/cmake/setup.sh"` exists.
+**Checkpoint:** `ls "$SRC_ROOT/cmake/setup.sh"` exists; optional
+`FindDFTD4.cmake` under `$SRC_ROOT/cmake/`.
 
 ---
 
@@ -114,13 +119,18 @@ ls -l "$SRC_ROOT/src/lib/CMakeLists.txt"
 
 ---
 
-## Stage 3 — Apply Win32 patches
+## Stage 3 — Apply Win32 / BSE patches
+
+`0003` (DFTD4 CMake enable) is applied when staging `cmake/` (Stage 1 /
+pipeline unpack), together with `cmake_overlays/Find*.cmake` — not here.
 
 ```bash
 cd "$SRC_ROOT"
-patch --forward -p1 < "$PATCH_DIR/0001-dclock_-win32-getrusage.patch"
-patch --forward -p1 < "$PATCH_DIR/0002-timing_-win32-getrusage.patch"
-patch --forward -p1 < "$PATCH_DIR/0004-autoset-available-memory-win32.patch"
+patch --forward -l -p1 < "$PATCH_DIR/0001-dclock_-win32-getrusage.patch"
+patch --forward -l -p1 < "$PATCH_DIR/0002-timing_-win32-getrusage.patch"
+patch --forward -l -p1 < "$PATCH_DIR/0004-autoset-available-memory-win32.patch"
+patch --forward -l -p1 < "$PATCH_DIR/0005-bse-guard-avpw-zeroing.patch"
+patch --forward -l -p1 < "$PATCH_DIR/0006-bse-lqp-force-ibse0.patch"
 cd "$DELIV"
 ```
 
@@ -130,10 +140,18 @@ cd "$DELIV"
 grep -c win32_filetime_to_sec "$SRC_ROOT/src/lib/dclock_.c"   # expect >0
 grep -c win32_filetime_to_sec "$SRC_ROOT/src/lib/timing_.c"   # expect >0
 grep -c vasp_win32_available_memory_kb "$SRC_ROOT/src/ini.F"  # expect >0
+grep -c 'IF (ALLOCATED(AVpW)) AVpW=0' "$SRC_ROOT/src/bse.F"  # expect >0
+grep -c 'QPBSE/LQP: forcing IBSE=0' "$SRC_ROOT/src/bse.F"    # expect >0
 ```
 
 Re-running is safe if a patch says "already applied".
-See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md) for the MAXMEM helper.
+See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md) and
+[docs/BSE_WIN32_GUARDS.md](docs/BSE_WIN32_GUARDS.md).
+
+The automated pipeline also compiles and links the MS-MPI `--wrap` shim at
+configure time ([docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md)).
+Manual Stage 4 below is a minimal cmake line; prefer `build_pipeline.sh` for
+the wrap injects.
 
 ---
 
@@ -234,6 +252,22 @@ ZIP and checksum are **gitignored** — keep them local.
 
 Unzip the artifact, drop a small licensed test set (`INCAR POSCAR POTCAR
 KPOINTS`), run `run.bat`. Expect `OUTCAR`, `OSZICAR`, `CONTCAR`.
+
+---
+
+## Optional — develop rebuild (no ZIP)
+
+After one successful full unpack/configure (or a prior `release` run), iterate
+on shims / patches without wiping `build_work`:
+
+```bash
+VASP_PIPELINE_MODE=develop VASP_TARBALL="$VASP_TARBALL" bash "$DELIV/build_pipeline.sh"
+# or: bash "$DELIV/build_pipeline.sh" --develop "$VASP_TARBALL"
+# Copy new build/bin/vasp_*.exe over an existing portable bin/ for testsuite.
+```
+
+`develop` never `rm -rf` the work tree; it skips harvest / package / zip.
+See [docs/DESIGN.md](docs/DESIGN.md).
 
 ---
 

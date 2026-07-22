@@ -124,16 +124,33 @@ gcc -c shim/msmpi_inplace_wrap.c -I${MINGW_PREFIX}/include -o build/msmpi_inplac
   -Wl,--wrap=mpi_alltoall_
   -Wl,--wrap=mpi_alltoallv_
   -Wl,--wrap=mpi_iallgather_
+  -Wl,--wrap=mpi_bcast_
   -Wl,--wrap=mpi_waitall_
   -Wl,--wrap=mpi_get_
+  -Wl,--wrap=blacs_gridinit_
+  -Wl,--wrap=blacs_gridmap_
   + msmpi_inplace_wrap.o
 ```
 
-Override the symbol list with `MSMPI_WRAP_SYMS` (space-separated in the
-shell; converted to CMake `;` list) if `nm` on `vasp_std.exe` shows additional
-collectives that take `sendbuf` / `MPI_IN_PLACE`.
+Default `MSMPI_WRAP_SYMS` (space-separated in the shell; converted to CMake
+`;` list) matches the list above. Override if `nm` on `vasp_std.exe` shows
+additional collectives that take `sendbuf` / `MPI_IN_PLACE`.
 
-Optional: `MSMPI_WRAP_DEBUG=1` prints when a fake sentinel is rewritten.
+`MSMPI_WRAP_DEBUG` (unset / `0` / empty = **off**; mere presence must **not**
+enable):
+
+| Value | Behavior |
+| --- | --- |
+| unset / `0` | Off |
+| `1` | Rank 0 only; NULL-dt / BAD always; remaps rate-limited |
+| `2` | Rank 0 only; every wrapped call (line-atomic) |
+
+`toolchain/run_testsuite.sh` overlays forward a non-zero value via
+`mpiexec -env`. Prefer unset for normal validation.
+
+BLACS TopsRepeat after `gridinit`/`gridmap` is **default OFF**; opt in with
+`MSMPI_BLACS_TOPSREPEAT=1` only for diagnosis. Full write-up:
+[MSMPI_INPLACE_SHIM.md](MSMPI_INPLACE_SHIM.md).
 
 **Black-box probe (Allreduce only):** `%TEMP%\mpi-inplace-wrap-test` --
 nowrap returns zeros; wrap passes `mpiexec -n 1` and `-n 2`.
