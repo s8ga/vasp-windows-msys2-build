@@ -10,7 +10,7 @@ Toolchain (open source + Microsoft MPI):
 gfortran (UCRT64) + MS-MPI + OpenBLAS + ScaLAPACK(msmpi) + FFTW + OpenMP + fftlib + HDF5
 ```
 
-**This repository does not ship VASP source code, POTCAR files, or prebuilt
+**This repository does not, and never will ship ANY VASP source code, POTCAR files, or prebuilt
 binaries.** You must provide your own licensed VASP tarball outside this repo.
 
 ---
@@ -22,11 +22,13 @@ binaries.** You must provide your own licensed VASP tarball outside this repo.
 | --------------------- | ------------------------------------------------------------------ |
 | `build_pipeline.sh`   | **Single source of truth** — one-command driver (preflight → zip)  |
 | `toolchain/`          | Thin English entry points (deps / env / call pipeline / testsuite) |
+| `toolchain/scripts/inject_vtst.sh` | Optional VTST overlay (`VASP_VTST=ON`; see [docs/VTST.md](docs/VTST.md)) |
 | `testsuite_overlays/` | MS-MPI fast/all conf overlays copied into extracted `testsuite/`   |
 | `patches/`            | Win32 timing + MAXMEM + DFTD4 CMake enable + BSE/QPBSE guards      |
 | `cmake_overlays/`     | `FindDFTD4.cmake` / `FindLibXC.cmake` copied into staged `cmake/`  |
 | `shim/`               | MS-MPI `--wrap`, FFTW planner, Win32 MAXMEM, optional GOMP SRW     |
 | `vasp_cmake/`         | Official VASP CMake port (**git submodule**)                       |
+| Work trees            | `build_work/{stock\|vtst}/<stamp>/` + per-flavor `CURRENT`         |
 
 
 Research notes and evidence from the original workspace are intentionally
@@ -134,8 +136,8 @@ bash build_pipeline.sh /c/path/to/vasp.6.6.0.tgz
 
 | Mode | Behavior |
 | --- | --- |
-| `release` | Full pipeline through portable ZIP |
-| `develop` | Reuse existing `build_work` (never `rm -rf`); rebuild only; skip harvest/package/zip |
+| `release` | New `build_work/<flavor>/<stamp>/`; full pipeline through portable ZIP; writes `CURRENT` |
+| `develop` | Reuse that flavor’s `CURRENT` (or explicit `WORK_DIR`); rebuild only; skip harvest/package/zip |
 
 ```bash
 # After one successful release unpack/configure:
@@ -144,9 +146,28 @@ VASP_PIPELINE_MODE=develop VASP_TARBALL=/c/path/to/vasp.6.6.0.tgz bash build_pip
 # Then copy new build/bin/vasp_*.exe over an existing portable bin/ for testsuite.
 ```
 
-Stages (`release`): `preflight → unpack → setup → patch → configure → build → harvest → package`.
+Stages (`release`): `preflight → unpack → setup → patch → (optional VTST inject) → configure → build → harvest → package`.
 
-**Output (local, gitignored):** `vasp-6.6.0-msys2-portable.zip` (+ `.sha256`).
+**Output (local, gitignored):**
+
+| Build | ZIP (+ `.sha256`) |
+| --- | --- |
+| Stock (`VASP_VTST=OFF`, default) | `vasp-6.6.0-msys2-portable.zip` |
+| VTST (`VASP_VTST=ON`) | `vasp-6.6.0-msys2-portable-vtst.zip` |
+
+### Optional VTST
+
+Default is stock VASP. To overlay user-supplied [vtstcode](https://theory.cm.utexas.edu/vtsttools/)
+(Apache-2.0; **you** download it — not shipped here; v1 includes PyAMFF):
+
+```bash
+export VASP_VTST=ON
+export VTST_CODE_DIR='/c/path/to/vtstcode6.6.0'   # directory containing chain.F
+bash toolchain/build_vasp.sh
+```
+
+Stock and VTST use separate work trees (`build_work/stock/…` vs
+`build_work/vtst/…`). Full details: [docs/VTST.md](docs/VTST.md).
 
 ### Tunables
 
@@ -155,13 +176,16 @@ Stages (`release`): `preflight → unpack → setup → patch → configure → 
 | -------------------------- | ---------------------------- | ------------------------------------------------------------------- |
 | `VASP_TARBALL`             | `$1`                         | Path to the VASP source tarball (MSYS `/c/...` or Windows `C:\...`) |
 | `VASP_PIPELINE_MODE`       | `release`                    | `release` (ZIP) or `develop` (rebuild only; no unpack wipe)         |
+| `VASP_VTST`                | `OFF`                        | `ON` → VTST inject + `build_work/vtst/…` + `-vtst` artifact name    |
+| `VTST_CODE_DIR`            | *(empty)*                    | Required when `VASP_VTST=ON`; unpacked vtstcode tree                |
+| `WORK_DIR`                 | *(auto)*                     | Override stamp/`CURRENT` path (advanced)                            |
 | `VASP_HDF5` / `VASP_LIBXC` / `VASP_WANNIER90` / `VASP_DFTD4` | `ON` | Optional features (`DFTD4` needs `cmake_overlays/` + `0003`) |
 | `VASP_OPENMP` / `VASP_FFTLIB` | `ON`                      | OpenMP / internal fftlib                                            |
 | `VASP_GOMP_CRITICAL_WIN32` | `OFF`                        | Diagnostic SRW lock for one named GOMP critical — keep **OFF**      |
 | `TARGET_CPU`               | `x86-64`                     | CPU baseline (`-march=`); use `native` for local speed              |
 | `NUM_CORES`                | *(unset)*                    | Override ninja `-j` (else RAM-capped `nproc`)                       |
 | `BUILD_VARIANTS`           | `vasp_std vasp_gam vasp_ncl` | Exes to harvest/bundle                                              |
-| `PKG_NAME`                 | `vasp-6.6.0-msys2-portable`  | Artifact name                                                       |
+| `PKG_NAME`                 | `vasp-6.6.0-msys2-portable`  | Artifact name (`-vtst` appended automatically when `VASP_VTST=ON`)  |
 | `MINGW_PREFIX`             | `/ucrt64`                    | Resolved with `pwd -P` (Scoop symlinks OK)                          |
 | `ALLOW_NON_UCRT64`         | *(unset)*                    | Set `1` to skip the UCRT64 hard gate                                |
 | `MSMPI_BIN`                | *(auto)*                     | Directory containing host `mpiexec.exe`                             |
@@ -184,12 +208,20 @@ For a stage-by-stage walkthrough, see [STEP_BY_STEP.md](STEP_BY_STEP.md).
 
 ## 3. Portable ZIP usage
 
-Unzip anywhere. Place `INCAR`, `POSCAR`, `POTCAR`, `KPOINTS` next to `run.bat`,
-then double-click `run.bat` (4-rank MS-MPI by default):
+Unzip anywhere (stock or `-vtst` package). **`run.bat` keeps your current
+directory** — it does **not** `cd` into the package root. Put job inputs in a
+job folder, then call the bat by absolute or relative path:
 
 ```bat
-.\bin\mpiexec.exe -n 4 .\bin\vasp_std.exe
+cd C:\jobs\my-sic
+C:\tools\vasp-6.6.0-msys2-portable\run.bat
+REM or:  ..\vasp-6.6.0-msys2-portable\run.bat
 ```
+
+The job directory must contain `INCAR` (plus the usual `POSCAR` / `POTCAR` /
+`KPOINTS`). If `INCAR` is missing, `run.bat` prints an error and exits with
+code 1. Default launch is 4-rank MS-MPI via the bundled launcher under
+`%VASP_HOME%bin\` (package directory from `%~dp0`).
 
 The package is self-contained: no MSYS2 or MS-MPI install is required on the
 target machine (DLLs + launcher are bundled).
@@ -197,7 +229,7 @@ target machine (DLLs + launcher are bundled).
 ### Layout
 
 ```text
-vasp-6.6.0-msys2-portable/
+vasp-6.6.0-msys2-portable/          (or …-portable-vtst/)
 ├── bin/
 │   ├── vasp_std.exe  vasp_gam.exe  vasp_ncl.exe
 │   ├── mpiexec.exe  smpd.exe  msmpi.dll
@@ -208,8 +240,8 @@ vasp-6.6.0-msys2-portable/
 └── run.bat
 ```
 
-`run.bat` sets `OMP_NUM_THREADS=1` and `OPENBLAS_NUM_THREADS=1` so OpenBLAS
-does not oversubscribe cores under MPI.
+`run.bat` sets `OMP_NUM_THREADS=1` and `OPENBLAS_NUM_THREADS=1` (and passes
+them with `mpiexec -env`) so OpenBLAS does not oversubscribe cores under MPI.
 
 ---
 
@@ -218,10 +250,10 @@ does not oversubscribe cores under MPI.
 ## 3.1 Official VASP testsuite (optional)
 
 This repository does **not** ship the licensed `testsuite/` tree. After you
-unpack a VASP tarball (e.g. under `build_work/vasp.6.6.0/`), run the harness
-against the portable `bin/` with the MSYS2/MS-MPI overlays. A repo-root
-`testsuite/` copy (if present) is inspection-only; runtime uses the extracted
-tree plus `testsuite_overlays/`.
+unpack a VASP tarball (e.g. under `build_work/stock/<stamp>/vasp.6.6.0/`), run
+the harness against the portable `bin/` with the MSYS2/MS-MPI overlays. A
+repo-root `testsuite/` copy (if present) is inspection-only; runtime uses the
+extracted tree plus `testsuite_overlays/`.
 
 Upstream docs: [Validation tests](https://vasp.at/wiki/Validation_tests).
 Official entry points are `make test` / `make test_all` or `./runtest`
@@ -235,6 +267,8 @@ bash toolchain/run_testsuite.sh --all    # full suite
 # Single / few recipes (recommended for debugging):
 bash toolchain/run_testsuite.sh --fast bulk_GaAs_ACFDT
 VASP_TESTSUITE_TESTS='bulk_BN_PBE0' bash toolchain/run_testsuite.sh --fast
+# Flavor: VASP_BUILD_FLAVOR=<name> (default stock), or VASP_VTST=ON → vtst.
+# See docs/VTST.md — suite is DFT regression, not VTST feature tests.
 ```
 
 Overrides:
@@ -242,19 +276,33 @@ Overrides:
 ```bash
 export TESTSUITE_ROOT='/c/path/to/vasp.6.6.0/testsuite'
 export VASP_PORTABLE_BIN='/c/path/to/vasp-6.6.0-msys2-portable/bin'
+# or: export VASP_BUILD_FLAVOR=vtst
 bash toolchain/run_testsuite.sh --fast bulk_GaAs_ACFDT
 ```
 
 What the runner does:
 
-1. Resolves testsuite: `TESTSUITE_ROOT` → `SRC_ROOT/testsuite` →
-   `WORK_DIR/*/testsuite` (never repo-root `/testsuite`)
-2. Copies `testsuite_overlays/msys2_msmpi_{fast,all}.conf` into that directory
-3. Builds `compare_numbertable_new` (gfortran) into `${TESTSUITE_ROOT}/tools/`
-4. Sets `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, and `PATH` for the
+1. Sources `toolchain/env_ucrt64.sh` (which loads gitignored `local.env` when
+   present) **before** resolving flavor — so `VASP_BUILD_FLAVOR` /
+   `VASP_VTST` / `PKG_NAME` in `local.env` apply. Prefer
+   `export FOO="${FOO:-value}"` in `local.env` so a CLI-exported value still wins.
+2. Resolves flavor: `VASP_BUILD_FLAVOR` (default `stock`), else
+   `VASP_VTST=ON`→`vtst` / `OFF`→`stock`. `VASP_VTST=ON` + non-`vtst` flavor → error.
+3. Resolves testsuite: `TESTSUITE_ROOT` → `SRC_ROOT/testsuite` →
+   `build_work/<flavor>/CURRENT` stamp → flavor stamps (never repo-root
+   `/testsuite`).
+4. Resolves portable `bin/`: `VASP_PORTABLE_BIN` → `PKG_NAME` / CURRENT harvest
+   (stock=`…-msys2-portable`; other=`…-msys2-portable-<flavor>` **exact only**) →
+   WORK_DIR / repo-root / flavor stamps. No silent cross-flavor fallback; if
+   CURRENT has only a mismatched `…-portable-*`, the runner **dies** listing
+   candidates (stock never auto-adopts a sole `…-portable-<other>`). Warns when
+   bin and testsuite come from different `build_work` stamps.
+5. Copies `testsuite_overlays/msys2_msmpi_{fast,all}.conf` into that directory
+6. Builds `compare_numbertable_new` (gfortran) into `${TESTSUITE_ROOT}/tools/`
+7. Sets `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, and `PATH` for the
    portable `bin/`; defaults `VASP_TESTSUITE_NRANKS=4`; exports positional
    recipe names as `VASP_TESTSUITE_TESTS`
-5. Runs `./runtest msys2_msmpi_fast.conf` or `msys2_msmpi_all.conf` **with the
+8. Runs `./runtest msys2_msmpi_fast.conf` or `msys2_msmpi_all.conf` **with the
    config file only** (MS-MPI `mpiexec` + `vasp_{std,gam,ncl}.exe`)
 
 Optional env the overlays forward (when set and not `0`): `MSMPI_WRAP_DEBUG`
@@ -326,7 +374,8 @@ no System-V shared memory.
 ## License reminder
 
 Build glue in this repository (scripts, patches, docs) is released under the
-[MIT License](LICENSE). VASP itself is proprietary. This repo only contains
-build glue and a pointer to the public CMake port. You are responsible for
-complying with your VASP license when obtaining source and running
-calculations.
+[MIT License](LICENSE). VASP itself is proprietary. Optional VTST / vtstcode is
+**Apache-2.0** and user-supplied — see [docs/VTST.md](docs/VTST.md). This repo
+only contains build glue and a pointer to the public CMake port. You are
+responsible for complying with your VASP (and, if used, VTST) licenses when
+obtaining source and running calculations.

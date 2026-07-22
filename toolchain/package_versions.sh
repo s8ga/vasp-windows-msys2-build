@@ -32,6 +32,16 @@ dftd4_ver="4.2.0"
 dftd4_sha256="467e024071510ad82b862c66c383c2ebc164fc1140e15dfc79f48d2f999fd184"
 dftd4_url="https://github.com/dftd4/dftd4/releases/download/v${dftd4_ver}/dftd4-${dftd4_ver}.tar.xz"
 
+# VTST / vtstcode (Henkelman group; Apache-2.0). Source-only overlay for VASP 6.6.x.
+# Pin is the GitHub archive of the named commit (contains vtstcode6.6.0/).
+# Not in the default OPTIONAL_LIBS list — install via install_vtst.sh or
+# OPTIONAL_LIBS="... vtst".
+vtst_ver="6.6.0"
+vtst_subdir="vtstcode6.6.0"
+vtst_commit="e34035138dded5e4436832eb2b7801247ca4c60d"
+vtst_sha256="423592fdb0b3d027e100ea57de2d797dd5b8f4badd17a0ee72c5e0be196e56e0"
+vtst_url="https://github.com/henkelmangroup/vtstcode/archive/${vtst_commit}.tar.gz"
+
 load_package_vars() {
   local package_name="$1"
   case "${package_name}" in
@@ -45,6 +55,9 @@ load_package_vars() {
       : # vars already set
       ;;
     dftd4)
+      : # vars already set
+      ;;
+    vtst)
       : # vars already set
       ;;
     *)

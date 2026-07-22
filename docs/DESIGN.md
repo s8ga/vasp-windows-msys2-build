@@ -6,14 +6,38 @@ a portable VASP Windows package with MSYS2 UCRT64.
 ## Boundaries
 
 - **In scope:** `build_pipeline.sh`, `patches/`, `shim/`, `cmake_overlays/`,
-  `toolchain/`, `testsuite_overlays/`, and the official CMake port as a git
-  submodule at `vasp_cmake/` ([vasp-dev/cmake](https://github.com/vasp-dev/cmake),
+  `toolchain/` (including optional `scripts/inject_vtst.sh`),
+  `testsuite_overlays/`, and the official CMake port as a git submodule at
+  `vasp_cmake/` ([vasp-dev/cmake](https://github.com/vasp-dev/cmake),
   branch `6.6.x`).
 - **Out of scope:** VASP private source, POTCAR / potpaw archives, portable ZIP
-  artifacts, oneAPI reference trees, and long research evidence dumps.
+  artifacts, vtstcode trees, oneAPI reference trees, and long research evidence
+  dumps.
 
 Research and experimental notes live in separate workspaces and are not mirrored
 here.
+
+## Work-tree layout
+
+Each **release** gets a new stamp directory under a flavor root. Stock and VTST
+never share a tree:
+
+```text
+build_work/
+  stock/
+    <YYYYMMDD-HHMMSS>/
+    CURRENT                 # latest successful stock release path
+  vtst/
+    <YYYYMMDD-HHMMSS>/
+    CURRENT
+```
+
+- `VASP_VTST=OFF` (default) → flavor `stock`; package
+  `vasp-6.6.0-msys2-portable`
+- `VASP_VTST=ON` → flavor `vtst`; package name gains `-vtst`; requires
+  user-supplied `VTST_CODE_DIR` (see [VTST.md](VTST.md))
+- Explicit `WORK_DIR` overrides stamp / `CURRENT` resolution
+- No automatic cleanup of old stamps
 
 ## Pipeline highlights
 
@@ -33,30 +57,41 @@ here.
      see [WIN32_MAXMEM.md](WIN32_MAXMEM.md))
    - `0005` / `0006` — BSE / QPBSE guards (`AVpW` ALLOCATED; LQP force
      `IBSE=0`; see [BSE_WIN32_GUARDS.md](BSE_WIN32_GUARDS.md))
-4. Configure with OpenBLAS + MS-MPI + ScaLAPACK + FFTW + HDF5 (+ optional
+4. **Optional VTST inject** (`VASP_VTST=ON`): after patch, before configure —
+   overlay user vtstcode via `toolchain/scripts/inject_vtst.sh` (core `*.F`
+   including `ml_pyamff.F`, `pyamff_fortran/` + CMake overlay, `main.F`,
+   `.objects`, staged `CMakeLists_src.txt` link). See [VTST.md](VTST.md).
+5. Configure with OpenBLAS + MS-MPI + ScaLAPACK + FFTW + HDF5 (+ optional
    LibXC / Wannier90 / DFTD4 from `toolchain/install`); disable SysV/SHMEM.
-5. Link the **MS-MPI Fortran sentinel `--wrap` shim**
+6. Link the **MS-MPI Fortran sentinel `--wrap` shim**
    ([MSMPI_INPLACE_SHIM.md](MSMPI_INPLACE_SHIM.md)) plus FFTW planner / Win32
    MAXMEM helpers via `CMAKE_PROJECT_TOP_LEVEL_INCLUDES` injects (never put
    `--wrap` on global `CMAKE_EXE_LINKER_FLAGS`). BLACS TopsRepeat wrap stays
    **default OFF**; GOMP SRW named-critical wrap
    (`VASP_GOMP_CRITICAL_WIN32`) stays **default OFF**.
-6. Harvest runtime DLLs using real MinGW paths (Scoop symlink-aware) and host
+7. Harvest runtime DLLs using real MinGW paths (Scoop symlink-aware) and host
    MS-MPI launcher files.
-7. Treat Windows API-set stubs (`api-ms-*`, `ext-ms-*`) as non-fatal for
+8. Treat Windows API-set stubs (`api-ms-*`, `ext-ms-*`) as non-fatal for
    packaging checks; fail only on missing bundlable MinGW/MS-MPI DLLs.
-8. Emit `run.bat` with `OMP_NUM_THREADS=1` / `OPENBLAS_NUM_THREADS=1`.
+9. Emit `run.bat` that **keeps the caller’s CWD** (job directory with `INCAR`);
+   binaries are resolved from `%~dp0bin`. Pin
+   `OMP_NUM_THREADS=1` / `OPENBLAS_NUM_THREADS=1`.
+
+Release stage order (abbreviated):
+
+`preflight → unpack → setup → patch → [inject_vtst] → configure → build → harvest → package → write CURRENT`
 
 ## Modes
 
 | Mode | Behavior |
 | --- | --- |
-| `release` (default) | Full pipeline through portable ZIP |
-| `develop` | Reuse existing `build_work` (never `rm -rf`); re-apply patches / wrap objects; rebuild only; skip harvest / package / zip |
+| `release` (default) | New `build_work/<flavor>/<stamp>/`; full pipeline through portable ZIP; update `CURRENT` |
+| `develop` | Reuse `build_work/<flavor>/CURRENT` (or `WORK_DIR`); re-apply patches / optional VTST inject; rebuild only; skip harvest / package / zip |
 
 ```bash
 VASP_PIPELINE_MODE=develop VASP_TARBALL=/c/path/to/vasp.tgz bash build_pipeline.sh
 # or: bash build_pipeline.sh --develop /c/path/to/vasp.tgz
+# VTST develop: VASP_VTST=ON VTST_CODE_DIR=... (uses build_work/vtst/CURRENT)
 ```
 
 ## Submodule

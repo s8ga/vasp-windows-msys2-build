@@ -1,0 +1,50 @@
+# VTST PyAMFF Fortran library (from henkelmangroup/vtstcode pyamff_fortran/).
+# Source order matches upstream pyamff_fortran/makefile SRC= list.
+# Copied into src/pyamff_fortran/CMakeLists.txt by inject_vtst.sh.
+#
+# MODULE PyAMFF (and friends) are written to fortran_mods/; consumers must
+# see that directory on the Fortran include path (USE PyAMFF in ml_pyamff.F).
+
+set(_PYAMFF_SRCS
+  fptype.f90
+  atoms.f90
+  neighborlist.f90
+  behlerParrinello.f90
+  nntype.f90
+  trainType.f90
+  normalization.f90
+  mtfort90.f90
+  fingerprints.f90
+  neuralnetwork.f90
+  nnmodule.f90
+  pyamffType.f90
+  lossgrad.f90
+  adam.f90
+  lbfgs_ml.f90
+  rprop.f90
+  opts.f90
+  training.f90
+  model.f90
+)
+
+add_library(pyamff_fortran STATIC ${_PYAMFF_SRCS})
+
+# Absolute module dir at generate time — reliable for PUBLIC includes and
+# $<TARGET_PROPERTY:...,Fortran_MODULE_DIRECTORY> on consumers.
+set(_pyamff_mod_dir "${CMAKE_CURRENT_BINARY_DIR}/fortran_mods")
+file(MAKE_DIRECTORY "${_pyamff_mod_dir}")
+set_target_properties(pyamff_fortran PROPERTIES
+  Fortran_MODULE_DIRECTORY "${_pyamff_mod_dir}"
+  POSITION_INDEPENDENT_CODE ON
+)
+# Plain absolute path (not only BUILD_INTERFACE genex) so link dependents
+# always get -I to pyamff.mod / related modules.
+target_include_directories(pyamff_fortran PUBLIC "${_pyamff_mod_dir}")
+
+if(VASP_FORTRAN_FLAGS)
+  target_compile_options(pyamff_fortran PRIVATE
+    $<$<COMPILE_LANGUAGE:Fortran>:${VASP_FORTRAN_FLAGS}>
+  )
+endif()
+
+message(STATUS "VTST: building pyamff_fortran static library (mods: ${_pyamff_mod_dir})")

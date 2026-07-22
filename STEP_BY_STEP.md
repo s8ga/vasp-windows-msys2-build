@@ -15,7 +15,10 @@ All commands run in the **MSYS2 UCRT64** shell unless noted.
 # >>> adjust these paths >>>
 export DELIV="$PWD"
 export VASP_TARBALL="/c/Users/you/Downloads/vasp.6.6.0.tar.gz"
-export WORK="$DELIV/build_work"
+# Automated pipeline uses build_work/<stock|vtst>/<stamp>/; for hand stages
+# pick one stamp (or a scratch path). Do not wipe sibling stamps.
+export WORK="$DELIV/build_work/stock/manual"
+# Optional VTST later: VASP_VTST=ON + VTST_CODE_DIR (see docs/VTST.md)
 
 # >>> usually unchanged >>>
 export MINGW_PREFIX="/ucrt64"
@@ -25,7 +28,7 @@ export TARGET_CPU="x86-64"
 export VASP_CMAKE_DIR="$DELIV/vasp_cmake"
 export PATCH_DIR="$DELIV/patches"
 
-echo "DELIV=$DELIV"; echo "TARBALL=$VASP_TARBALL"
+echo "DELIV=$DELIV"; echo "TARBALL=$VASP_TARBALL"; echo "WORK=$WORK"
 [ -f "$VASP_TARBALL" ] || echo "WARNING: tarball path does not resolve yet"
 [ -f "$VASP_CMAKE_DIR/setup.sh" ] || echo "WARNING: init submodule (git submodule update --init)"
 ```
@@ -110,6 +113,9 @@ ls "$VASP_CMAKE_DIR/setup.sh"
 
 ## Stage 1 — Unpack source & stage CMake port
 
+Clear **only** this `$WORK` path (never `rm -rf` all of `build_work/` — stock
+and vtst stamps may coexist):
+
 ```bash
 rm -rf "$WORK" && mkdir -p "$WORK"
 tar -xf "$VASP_TARBALL" -C "$WORK"
@@ -184,6 +190,31 @@ See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md) and
 
 The automated pipeline also compiles and links the MS-MPI `--wrap` shim at
 configure time ([docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md)).
+
+---
+
+## Stage 3b — Optional VTST inject (skip unless you need VTST)
+
+Default builds are **stock** (no VTST). If you want transition-state tools,
+obtain [vtstcode](https://theory.cm.utexas.edu/vtsttools/) yourself (Apache-2.0;
+not shipped here) and inject **after** Stage 3 patches, **before** configure.
+v1 includes PyAMFF (`ml_pyamff.F` + `pyamff_fortran` CMake lib). Prefer the pipeline switch over hand steps:
+
+```bash
+export VASP_VTST=ON
+export VTST_CODE_DIR='/c/path/to/vtstcode6.6.0'   # contains chain.F
+# release → build_work/vtst/<stamp>/ + vasp-*-msys2-portable-vtst.zip
+bash "$DELIV/toolchain/build_vasp.sh" "$VASP_TARBALL"
+```
+
+Standalone inject against an already-unpacked tree:
+
+```bash
+VASP_VTST=ON SRC_ROOT="$SRC_ROOT" VTST_CODE_DIR="$VTST_CODE_DIR" \
+  bash "$DELIV/toolchain/scripts/inject_vtst.sh"
+```
+
+Details: [docs/VTST.md](docs/VTST.md).
 
 ---
 
@@ -289,15 +320,23 @@ those. Fail only if real `lib*.dll` / `msmpi*.dll` are missing.
 
 ## Stage 7 — run.bat + zip
 
+`run.bat` must **keep the caller’s CWD** (job folder with `INCAR`). Do not
+`cd /d "%~dp0"`. Prefer the pipeline’s `emit_run_bat`; a minimal sketch:
+
 ```bash
 cat > "$PKG/run.bat" <<'BATCH'
 @echo off
-cd /d "%~dp0"
-set PATH=%~dp0bin;%PATH%
+REM Keep caller's CWD. Binaries from package dir (%~dp0).
+set "VASP_HOME=%~dp0"
+set "PATH=%VASP_HOME%bin;%PATH%"
 set OMP_NUM_THREADS=1
 set OPENBLAS_NUM_THREADS=1
+if not exist "INCAR" (
+  echo [run.bat] ERROR: no INCAR in current directory.
+  exit /b 1
+)
 echo Starting VASP on 4 cores...
-.\bin\mpiexec.exe -n 4 .\bin\vasp_std.exe
+"%VASP_HOME%bin\mpiexec.exe" -n 4 -env OMP_NUM_THREADS 1 -env OPENBLAS_NUM_THREADS 1 "%VASP_HOME%bin\vasp_std.exe"
 pause
 BATCH
 
@@ -306,30 +345,41 @@ BATCH
 cat "$DELIV/vasp-6.6.0-msys2-portable.zip.sha256"
 ```
 
-ZIP and checksum are **gitignored** — keep them local.
+For a VTST build the directory / ZIP name is `vasp-6.6.0-msys2-portable-vtst`
+(pipeline appends `-vtst` when `VASP_VTST=ON`). ZIP and checksum are
+**gitignored** — keep them local.
 
 ---
 
 ## Stage 8 — Smoke test
 
-Unzip the artifact, drop a small licensed test set (`INCAR POSCAR POTCAR
-KPOINTS`), run `run.bat`. Expect `OUTCAR`, `OSZICAR`, `CONTCAR`.
+Unzip the artifact. `cd` into a job folder that already has a small licensed
+test set (`INCAR POSCAR POTCAR KPOINTS`), then call `run.bat` by path (do not
+require inputs next to the bat):
+
+```bat
+cd C:\jobs\my-smoke
+C:\path\to\vasp-6.6.0-msys2-portable\run.bat
+```
+
+Expect `OUTCAR`, `OSZICAR`, `CONTCAR`.
 
 ---
 
 ## Optional — develop rebuild (no ZIP)
 
-After one successful full unpack/configure (or a prior `release` run), iterate
-on shims / patches without wiping `build_work`:
+After one successful `release`, iterate on shims / patches without a new stamp.
+`develop` reads `build_work/<flavor>/CURRENT` (or an explicit `WORK_DIR`):
 
 ```bash
 VASP_PIPELINE_MODE=develop VASP_TARBALL="$VASP_TARBALL" bash "$DELIV/toolchain/build_vasp.sh"
 # or: bash "$DELIV/build_pipeline.sh" --develop "$VASP_TARBALL"
+# VTST: VASP_VTST=ON VTST_CODE_DIR=...  → uses build_work/vtst/CURRENT
 # Copy new build/bin/vasp_*.exe over an existing portable bin/ for testsuite.
 ```
 
 `develop` never `rm -rf` the work tree; it skips harvest / package / zip.
-See [docs/DESIGN.md](docs/DESIGN.md).
+See [docs/DESIGN.md](docs/DESIGN.md) and [docs/VTST.md](docs/VTST.md).
 
 ---
 

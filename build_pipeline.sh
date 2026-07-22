@@ -4,14 +4,18 @@
 #
 # Modes (VASP_PIPELINE_MODE):
 #   release (default) — full pipeline: tarball --> portable green ZIP
-#   develop           — reuse existing build_work, stop after build
+#                       WORK_DIR defaults to build_work/<flavor>/<stamp>/
+#   develop           — reuse CURRENT (or explicit WORK_DIR), stop after build
 #                       (no unpack wipe, no harvest/package/zip)
+#
+# Flavor (VASP_VTST): OFF → stock (default); ON → vtst (+ PKG_NAME -vtst suffix)
 #
 # Run inside an MSYS2 *UCRT64* shell:
 #     VASP_TARBALL=/c/path/to/vasp.6.6.0.tgz bash build_pipeline.sh
 #     bash build_pipeline.sh /c/path/to/vasp.6.6.0.tgz
 #     VASP_PIPELINE_MODE=develop VASP_TARBALL=... bash build_pipeline.sh
 #     bash build_pipeline.sh --develop /c/path/to/vasp.6.6.0.tgz
+#     VASP_VTST=ON VTST_CODE_DIR=/c/path/to/vtstcode6.6.0 bash build_pipeline.sh
 #
 # VASP_TARBALL may be MSYS (/c/...) or Windows (C:\... / C:/...); preflight
 # normalizes via to_msys_path before the existence check.
@@ -22,10 +26,12 @@
 #   ./shim/              MS-MPI wrap, FFTW, Win32 available-memory helper
 #   ./cmake_overlays/    FindDFTD4.cmake / FindLibXC.cmake (copied into staged cmake/)
 #   ./toolchain/install/ self-built HDF5/LibXC/Wannier90/DFTD4 (via install/setup)
+#   ./toolchain/scripts/inject_vtst.sh  optional VTST overlay (when VASP_VTST=ON)
 #
-# release stages: preflight, unpack, setup, patch, configure, build, harvest,
-#                 package, zip
-# develop stages: preflight, locate tree, patch, (configure if needed), build
+# release stages: preflight, unpack, setup, patch, inject_vtst, configure, build,
+#                 harvest, package, zip, write CURRENT
+# develop stages: preflight, locate tree, patch, inject_vtst, (configure if needed),
+#                 build
 # =============================================================================
 set -euo pipefail
 
@@ -39,7 +45,12 @@ VASP_CMAKE_DIR="${VASP_CMAKE_DIR:-${SCRIPT_DIR}/vasp_cmake}"
 PATCH_DIR="${PATCH_DIR:-${SCRIPT_DIR}/patches}"
 CMAKE_OVERLAY_DIR="${CMAKE_OVERLAY_DIR:-${SCRIPT_DIR}/cmake_overlays}"
 TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-${SCRIPT_DIR}/toolchain}"
-WORK_DIR="${WORK_DIR:-${SCRIPT_DIR}/build_work}"
+# WORK_DIR: if unset, resolve_flavor_and_work_dir() picks
+#   release → build_work/<flavor>/<stamp>/
+#   develop → path from build_work/<flavor>/CURRENT
+# Explicit WORK_DIR is always respected.
+WORK_DIR_FROM_ENV="${WORK_DIR:-}"
+WORK_DIR=""
 BUILD_DIR_NAME="${BUILD_DIR_NAME:-build}"
 PKG_NAME="${PKG_NAME:-vasp-6.6.0-msys2-portable}"
 MINGW_PREFIX="${MINGW_PREFIX:-/ucrt64}"
@@ -56,6 +67,11 @@ VASP_DFTD4="${VASP_DFTD4:-ON}"
 VASP_FFTLIB="${VASP_FFTLIB:-ON}"
 # OpenMP (ON default). OFF = diagnostic: no GOMP CRITICAL in fftbas_plan path.
 VASP_OPENMP="${VASP_OPENMP:-ON}"
+# Optional VTST (transition-state tools). ON → flavor=vtst, inject after patch,
+# PKG_NAME gains -vtst. Requires VTST_CODE_DIR (checked by inject_vtst.sh).
+VASP_VTST="${VASP_VTST:-OFF}"
+VTST_CODE_DIR="${VTST_CODE_DIR:-}"
+FLAVOR=""
 # Experimental diagnostic only: replace VASP's named FFT planner CRITICAL
 # with a native Win32 SRW lock. Default OFF: the mpi_waitall_ /MPIPRIV2/
 # sentinel fix prevents the BSS corruption that previously damaged this lock.
@@ -197,11 +213,16 @@ Usage:
   bash build_pipeline.sh /c/path/to/vasp.tgz
   VASP_PIPELINE_MODE=develop VASP_TARBALL=... bash build_pipeline.sh
   bash build_pipeline.sh --develop /c/path/to/vasp.tgz
+  VASP_VTST=ON VTST_CODE_DIR=/c/path/to/vtstcode bash build_pipeline.sh
 
 Modes (VASP_PIPELINE_MODE):
   release  full pipeline through portable ZIP (default)
-  develop  reuse build_work; rebuild only; skip harvest/package/zip
-           (never rm -rf build_work; requires a prior release unpack)
+           WORK_DIR = build_work/<stock|vtst>/<stamp>/ unless set
+  develop  reuse CURRENT (or WORK_DIR); rebuild only; skip harvest/package/zip
+
+Flavor (VASP_VTST=OFF|ON):
+  OFF  stock tree; PKG_NAME = vasp-6.6.0-msys2-portable
+  ON   vtst tree + inject; PKG_NAME gains -vtst; needs VTST_CODE_DIR
 EOF
         exit 0
         ;;
@@ -226,6 +247,84 @@ EOF
 
 stage() { # stage <n> <name>
   log "[$1] $2"
+}
+
+#-----------------------------------------------------------------------------
+# resolve_flavor_and_work_dir — flavor, PKG -vtst, WORK_DIR stamp/CURRENT
+# Call after parse_args (mode known). Respects explicit WORK_DIR.
+#-----------------------------------------------------------------------------
+resolve_flavor_and_work_dir() {
+  case "${VASP_VTST}" in
+    ON|OFF) ;;
+    *) die "VASP_VTST must be ON or OFF (got '${VASP_VTST}')" ;;
+  esac
+
+  if [ "${VASP_VTST}" = "ON" ]; then
+    FLAVOR="vtst"
+  else
+    FLAVOR="stock"
+  fi
+
+  # Auto-append -vtst when ON (do not duplicate if already present).
+  if [ "${VASP_VTST}" = "ON" ]; then
+    case "${PKG_NAME}" in
+      *-vtst) ;;
+      *) PKG_NAME="${PKG_NAME}-vtst" ;;
+    esac
+  fi
+
+  if [ -n "${WORK_DIR_FROM_ENV}" ]; then
+    WORK_DIR="${WORK_DIR_FROM_ENV}"
+    log "WORK_DIR (user override): ${WORK_DIR}"
+  elif [ "${VASP_PIPELINE_MODE}" = "develop" ]; then
+    local current_file="${SCRIPT_DIR}/build_work/${FLAVOR}/CURRENT"
+    [ -f "${current_file}" ] \
+      || die "develop: missing ${current_file} — run a ${FLAVOR} release first, or set WORK_DIR"
+    WORK_DIR="$(tr -d '\r\n' < "${current_file}")"
+    [ -n "${WORK_DIR}" ] || die "develop: ${current_file} is empty"
+    [ -d "${WORK_DIR}" ] \
+      || die "develop: CURRENT points to missing dir: ${WORK_DIR}"
+    log "WORK_DIR (from ${FLAVOR}/CURRENT): ${WORK_DIR}"
+  else
+    # release: new per-build stamp under build_work/<flavor>/
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    WORK_DIR="${SCRIPT_DIR}/build_work/${FLAVOR}/${stamp}"
+    log "WORK_DIR (new stamp): ${WORK_DIR}"
+  fi
+
+  export WORK_DIR FLAVOR PKG_NAME VASP_VTST
+  [ -n "${VTST_CODE_DIR}" ] && export VTST_CODE_DIR
+}
+
+# After successful release package: point flavor CURRENT at this WORK_DIR.
+write_flavor_current() {
+  local flavor_root="${SCRIPT_DIR}/build_work/${FLAVOR}"
+  local abs
+  mkdir -p "${flavor_root}"
+  abs="$(cd "${WORK_DIR}" && pwd)" || die "cannot resolve WORK_DIR for CURRENT: ${WORK_DIR}"
+  printf '%s\n' "${abs}" > "${flavor_root}/CURRENT"
+  log "updated ${flavor_root}/CURRENT -> ${abs}"
+}
+
+# Optional VTST overlay after patch_sources (release + develop).
+# When ON: requires toolchain/scripts/inject_vtst.sh and VTST_CODE_DIR (script dies).
+inject_vtst_sources() {
+  if [ "${VASP_VTST}" != "ON" ]; then
+    log "VASP_VTST=${VASP_VTST} — skip VTST inject"
+    return 0
+  fi
+  local script="${SCRIPT_DIR}/toolchain/scripts/inject_vtst.sh"
+  [ -f "${script}" ] \
+    || die "VASP_VTST=ON but inject script missing: ${script}"
+  stage "3b" "inject VTST (vtstcode overlay)"
+  [ -n "${SRC_ROOT:-}" ] || die "SRC_ROOT unset before VTST inject"
+  export SRC_ROOT VASP_VTST
+  if [ -n "${VTST_CODE_DIR}" ]; then
+    export VTST_CODE_DIR
+  fi
+  # Missing VTST_CODE_DIR → inject_vtst.sh dies with a clear message.
+  bash "${script}" || die "VTST inject failed (VASP_VTST=ON)"
 }
 
 # Resolve the first existing path among several candidates; echo it, empty if none
@@ -294,7 +393,7 @@ source_toolchain_optional() {
   fi
   export TOOLCHAIN_INSTALL_REAL
   log "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}"
-  log "features: HDF5=${VASP_HDF5} LIBXC=${VASP_LIBXC} WANNIER90=${VASP_WANNIER90} DFTD4=${VASP_DFTD4} OPENMP=${VASP_OPENMP}"
+  log "features: HDF5=${VASP_HDF5} LIBXC=${VASP_LIBXC} WANNIER90=${VASP_WANNIER90} DFTD4=${VASP_DFTD4} OPENMP=${VASP_OPENMP} VTST=${VASP_VTST} WORK_DIR=${WORK_DIR}"
 }
 
 # CMake cache wants ';' separators; env uses ':' under MSYS.
@@ -394,6 +493,9 @@ preflight() {
   resolve_mingw_prefix
   log "MINGW_PREFIX=${MINGW_PREFIX} (real=${MINGW_PREFIX_REAL})"
   log "VASP_PIPELINE_MODE=${VASP_PIPELINE_MODE}"
+  log "VASP_VTST=${VASP_VTST} flavor=${FLAVOR}"
+  log "WORK_DIR=${WORK_DIR}"
+  log "PKG_NAME=${PKG_NAME}"
 
   # Self-built optional libs (CMAKE_PREFIX_PATH before MINGW_PREFIX)
   source_toolchain_optional
@@ -433,6 +535,7 @@ develop_prepare() {
   locate_existing_tree
   # Idempotent: apply any new patches (e.g. 0004 MAXMEM) on existing tree
   patch_sources
+  inject_vtst_sources
   if [ ! -f "${BDIR}/CMakeCache.txt" ]; then
     warn "no CMake cache at ${BDIR}; running full configure (does not wipe WORK_DIR)"
     # configure() historically rm -rf BDIR — safe here because cache is absent.
@@ -491,13 +594,16 @@ develop_prepare() {
 }
 
 #-----------------------------------------------------------------------------
-# [1] unpack — extract source, locate root, stage vasp_cmake as cmake/
+# [1] unpack — extract source into this WORK_DIR stamp only (never wipe siblings)
 #-----------------------------------------------------------------------------
 unpack() {
   stage 1 "unpack"
-  rm -rf "${WORK_DIR}"
+  # Clear only the current stamp / override path — do NOT rm -rf all of build_work/.
+  if [ -e "${WORK_DIR}" ]; then
+    rm -rf "${WORK_DIR}"
+  fi
   mkdir -p "${WORK_DIR}"
-  log "extracting ${VASP_TARBALL} ..."
+  log "extracting ${VASP_TARBALL} into ${WORK_DIR} ..."
   # On Windows, relative symlinks under testsuite/POTCARS often fail and make
   # GNU tar exit non-zero. Keep going if src/ is present; optionally materialize
   # those POTCAR links as real file copies (default ON) so the testsuite can run.
@@ -901,8 +1007,9 @@ collect_unresolved_bundlable_dlls() { # <exe>
 emit_run_bat() { # emit_run_bat <outfile>
   cat > "$1" <<'BATCH'
 @echo off
-cd /d "%~dp0"
-set PATH=%~dp0bin;%PATH%
+REM Keep caller's CWD (job directory with INCAR/POSCAR/...). Do NOT cd to %~dp0.
+set "VASP_HOME=%~dp0"
+set "PATH=%VASP_HOME%bin;%PATH%"
 REM OpenBLAS (MSYS2) is OpenMP-threaded; under mpiexec -n N each rank must use
 REM a single BLAS thread, otherwise cores are oversubscribed and OpenBLAS's
 REM buffer allocator can fail. Pin both vars (OMP_NUM_THREADS is authoritative).
@@ -912,8 +1019,14 @@ set OPENBLAS_NUM_THREADS=1
 REM Multi-rank MS-MPI requires the MPI_IN_PLACE --wrap shim linked at build
 REM time (shim/msmpi_inplace_wrap.c). See docs/MSYS2_MSMPI_MULTIRANK.md.
 REM Optional: set MSMPI_WRAP_DEBUG=1 to log sentinel rewrites.
+if not exist "INCAR" (
+  echo [run.bat] ERROR: no INCAR in current directory.
+  echo [run.bat] cd to your job folder ^(with INCAR/POSCAR/POTCAR/KPOINTS^), then call this script.
+  echo [run.bat] VASP_HOME=%VASP_HOME%
+  exit /b 1
+)
 echo Starting VASP on 4 cores...
-.\bin\mpiexec.exe -n 4 -env OMP_NUM_THREADS 1 -env OPENBLAS_NUM_THREADS 1 -env OMP_DYNAMIC FALSE -env OMP_MAX_ACTIVE_LEVELS 1 .\bin\vasp_std.exe
+"%VASP_HOME%bin\mpiexec.exe" -n 4 -env OMP_NUM_THREADS 1 -env OPENBLAS_NUM_THREADS 1 -env OMP_DYNAMIC FALSE -env OMP_MAX_ACTIVE_LEVELS 1 "%VASP_HOME%bin\vasp_std.exe"
 pause
 BATCH
 }
@@ -970,12 +1083,13 @@ package() {
 #-----------------------------------------------------------------------------
 main() {
   parse_args "$@"
+  resolve_flavor_and_work_dir
   log "VASP Windows-native build (MSYS2 UCRT64, route C2)"
   log "mode: ${VASP_PIPELINE_MODE}"
   preflight
 
   if [ "${VASP_PIPELINE_MODE}" = "develop" ]; then
-    # Never unpack (would rm -rf WORK_DIR). Reuse tree; stop after build.
+    # Never unpack (would wipe this WORK_DIR stamp). Reuse tree; stop after build.
     develop_prepare
     build
     local v exe
@@ -1009,10 +1123,12 @@ main() {
   unpack
   setup
   patch_sources
+  inject_vtst_sources
   configure
   build
   harvest
   package
+  write_flavor_current
   log "DONE — green portable ZIP at ${SCRIPT_DIR}/${PKG_NAME}.zip"
 }
 

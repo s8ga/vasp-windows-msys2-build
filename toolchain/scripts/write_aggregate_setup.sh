@@ -2,8 +2,9 @@
 # =============================================================================
 # write_aggregate_setup.sh — assemble toolchain/install/setup from setup_* snippets
 #
-# Sources/copies setup_hdf5, setup_libxc, setup_wannier90, setup_dftd4 so that
-# CMAKE_PREFIX_PATH lists toolchain prefixes before MINGW_PREFIX (caller appends).
+# Sources/copies setup_hdf5, setup_libxc, setup_wannier90, setup_dftd4,
+# setup_vtst so that CMAKE_PREFIX_PATH lists toolchain prefixes before
+# MINGW_PREFIX (caller appends). setup_vtst exports VTST_CODE_DIR when present.
 #
 # Usage (MSYS2 UCRT64):
 #   bash toolchain/scripts/write_aggregate_setup.sh
@@ -61,6 +62,11 @@ copy_snip setup_dftd4 \
   "${BUILDDIR}/setup_dftd4" \
   "${INSTALL_ROOT}/dftd4-${dftd4_ver}/setup_dftd4" || true
 
+copy_snip setup_vtst \
+  "${INSTALL_ROOT}/setup_vtst" \
+  "${BUILDDIR}/setup_vtst" \
+  "${INSTALL_ROOT}/vtst-${vtst_ver}/setup_vtst.env" || true
+
 cat > "${OUT}" << 'EOF'
 # =============================================================================
 # toolchain/install/setup — aggregate optional-lib environment (generated)
@@ -97,7 +103,7 @@ fi
 
 # Source in a stable order. Each snippet prepends, so later snippets sit leftmost;
 # all toolchain prefixes remain ahead of any MINGW_PREFIX the caller appends.
-for _snip in setup_hdf5 setup_libxc setup_wannier90 setup_dftd4; do
+for _snip in setup_hdf5 setup_libxc setup_wannier90 setup_dftd4 setup_vtst; do
   if [ -f "${_tc_setup_dir}/${_snip}" ]; then
     # shellcheck disable=SC1090
     source "${_tc_setup_dir}/${_snip}"
@@ -115,7 +121,7 @@ unset _tc_setup_dir
 EOF
 
 printf '[setup] wrote %s\n' "${OUT}"
-for _s in setup_hdf5 setup_libxc setup_wannier90 setup_dftd4; do
+for _s in setup_hdf5 setup_libxc setup_wannier90 setup_dftd4 setup_vtst; do
   if [ -f "${INSTALL_ROOT}/${_s}" ]; then
     printf '[setup]   + %s\n' "${_s}"
   else

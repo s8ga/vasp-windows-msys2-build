@@ -13,25 +13,32 @@
 #   TESTSUITE_ROOT=/c/path/to/vasp.6.6.0/testsuite \
 #     VASP_PORTABLE_BIN=/c/path/to/vasp-*-msys2-portable/bin \
 #     bash toolchain/run_testsuite.sh
+#   # Flavor (generic): VASP_BUILD_FLAVOR / FLAVOR, or convenience VASP_VTST=ON → vtst
+#   # Resolve order: env_ucrt64 (+ local.env) → flavor/PKG_NAME → paths
+#   VASP_BUILD_FLAVOR=vtst bash toolchain/run_testsuite.sh --fast bulk_GaAs_ACFDT
+#   VASP_VTST=ON bash toolchain/run_testsuite.sh --fast bulk_GaAs_ACFDT
+#   # Resolve-only smoke (print paths, exit 0; no compare tool / runtest):
+#   TESTSUITE_RESOLVE_ONLY=1 bash toolchain/run_testsuite.sh
 #
 # Upstream ./runtest CLI is only: [-f|--fast|-a|--all] [config-file]
 # Recipe selection is via VASP_TESTSUITE_TESTS (see vasp.at wiki Validation_tests).
 # Extra names after --fast/--all here are exported as VASP_TESTSUITE_TESTS.
 #
 # This repo does NOT ship the licensed testsuite/. The runner:
-#   1) Locates extracted testsuite with runtest:
-#        TESTSUITE_ROOT > SRC_ROOT/testsuite > WORK_DIR/*/testsuite
+#   0) Sources env_ucrt64.sh (→ local.env) before resolving flavor
+#   1) Locates extracted testsuite with runtest (flavor-aware via CURRENT):
+#        TESTSUITE_ROOT > SRC_ROOT/testsuite >
+#        build_work/<flavor>/CURRENT stamp > WORK_DIR > flavor stamps
 #      (repo-root /testsuite is inspection-only — never used to run)
-#   2) Copies testsuite_overlays/msys2_msmpi_{fast,all}.conf into that directory
-#   3) Builds compare_numbertable_new into testsuite/tools/ (ephemeral)
-#   4) Sets thread env + PATH, then runs ./runtest <overlay.conf> only
+#   2) Locates portable bin/ (exact flavor package only; no cross-flavor fallback)
+#   3) Copies testsuite_overlays/msys2_msmpi_{fast,all}.conf into that directory
+#   4) Builds compare_numbertable_new into testsuite/tools/ (ephemeral)
+#   5) Sets thread env + PATH, then runs ./runtest <overlay.conf> only
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-OVERLAY_DIR="${TESTSUITE_OVERLAY_DIR:-${REPO_ROOT}/testsuite_overlays}"
-WORK_DIR="${WORK_DIR:-${REPO_ROOT}/build_work}"
 
 log()  { printf '\033[1;34m[testsuite]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -44,6 +51,218 @@ to_msys_path() {
   else
     printf '%s' "$p" | sed -e 's#^\([A-Za-z]\):#/\L\1#' -e 's#\\#/#g'
   fi
+}
+
+#-----------------------------------------------------------------------------
+# Env first (env_ucrt64 → local.env), then flavor / PKG_NAME, then paths.
+# Already-exported CLI vars win over local.env when local.env uses
+#   export FOO="${FOO:-value}"  (see local.env.example). Plain `export FOO=x`
+# overwrites. Do not use set -a here — env_ucrt64 owns MSMPI/PATH setup.
+#-----------------------------------------------------------------------------
+if [ -f "${SCRIPT_DIR}/env_ucrt64.sh" ] && [ "${SKIP_ENV_UCRT64:-}" != "1" ]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/env_ucrt64.sh" || warn "env_ucrt64.sh returned non-zero; continuing"
+fi
+
+OVERLAY_DIR="${TESTSUITE_OVERLAY_DIR:-${REPO_ROOT}/testsuite_overlays}"
+BUILD_WORK_ROOT="${BUILD_WORK_ROOT:-${REPO_ROOT}/build_work}"
+WORK_DIR="${WORK_DIR:-${BUILD_WORK_ROOT}}"
+
+#-----------------------------------------------------------------------------
+# Generic flavor (after env so local.env knobs apply)
+#   Primary: VASP_BUILD_FLAVOR (default stock) → build_work/<flavor>/CURRENT
+#   Convenience: VASP_VTST=ON|OFF when flavor unset → vtst|stock
+#   Portable dirs: stock → …-msys2-portable ; else → …-msys2-portable-<flavor>
+#   Exact match only — never silently adopt a different …-portable* package.
+#   New flavors: create build_work/<name>/CURRENT + matching package name suffix.
+#-----------------------------------------------------------------------------
+FLAVOR_EXPLICIT=0
+VASP_VTST="${VASP_VTST:-OFF}"
+case "${VASP_VTST}" in
+  ON|OFF) ;;
+  *) die "VASP_VTST must be ON or OFF (got '${VASP_VTST}'); or set VASP_BUILD_FLAVOR=<name>" ;;
+esac
+
+if [ -n "${VASP_BUILD_FLAVOR:-}" ]; then
+  FLAVOR="${VASP_BUILD_FLAVOR}"
+  FLAVOR_EXPLICIT=1
+elif [ -n "${FLAVOR:-}" ]; then
+  # Already exported (e.g. from pipeline / local.env)
+  FLAVOR_EXPLICIT=1
+elif [ "${VASP_VTST}" = "ON" ]; then
+  FLAVOR="vtst"
+  FLAVOR_EXPLICIT=1
+else
+  FLAVOR="stock"
+fi
+
+case "${FLAVOR}" in
+  ''|*[!a-zA-Z0-9_-]*)
+    die "invalid flavor '${FLAVOR}' (use [A-Za-z0-9_-]+ via VASP_BUILD_FLAVOR)"
+    ;;
+esac
+
+# VASP_VTST=ON always implies vtst; conflict with a different explicit flavor.
+if [ "${VASP_VTST}" = "ON" ] && [ "${FLAVOR}" != "vtst" ]; then
+  die "conflict: VASP_BUILD_FLAVOR/FLAVOR=${FLAVOR} but VASP_VTST=ON (implies vtst).
+  Unset VASP_VTST, or set VASP_BUILD_FLAVOR=vtst."
+fi
+
+export VASP_BUILD_FLAVOR="${FLAVOR}"
+export FLAVOR
+
+# Optional PKG_NAME override (pipeline-style); else derived from flavor convention.
+PKG_NAME="${PKG_NAME:-}"
+if [ -z "${PKG_NAME}" ]; then
+  if [ "${FLAVOR}" = "stock" ]; then
+    PKG_NAME="vasp-6.6.0-msys2-portable"
+  else
+    PKG_NAME="vasp-6.6.0-msys2-portable-${FLAVOR}"
+  fi
+fi
+
+bin_has_vasp() {
+  local b="$1"
+  [ -f "${b}/vasp_std.exe" ]
+}
+
+# Basename of a portable package dir matches this flavor?
+# stock: ends with -msys2-portable (no further -<flavor> suffix)
+# other: ends with -msys2-portable-<flavor>
+pkg_basename_matches_flavor() {
+  local base="$1"
+  if [ "${FLAVOR}" = "stock" ]; then
+    case "${base}" in
+      *-msys2-portable) return 0 ;;
+      *) return 1 ;;
+    esac
+  else
+    case "${base}" in
+      *-msys2-portable-"${FLAVOR}") return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+}
+
+# Print portable bin paths under root (one package level). Optionally filter by flavor.
+# Args: root [filter_flavor=1]
+collect_portable_bins_under() {
+  local root="$1"
+  local filter="${2:-1}"
+  local d base
+  [ -d "${root}" ] || return 0
+  shopt -s nullglob
+  for d in "${root}"/vasp-*-msys2-portable*; do
+    [ -d "${d}" ] || continue
+    base="$(basename "${d}")"
+    # Skip nested junk: require …/bin/vasp_std.exe
+    bin_has_vasp "${d}/bin" || continue
+    if [ "${filter}" = "1" ]; then
+      pkg_basename_matches_flavor "${base}" || continue
+    fi
+    printf '%s\n' "${d}/bin"
+  done
+  shopt -u nullglob
+}
+
+# Pick exactly one bin from newline list, or die listing candidates.
+pick_unique_bin_or_die() {
+  local context="$1"
+  local list="$2"
+  local n
+  n="$(printf '%s\n' "${list}" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "${n}" -eq 0 ]; then
+    return 1
+  fi
+  if [ "${n}" -gt 1 ]; then
+    die "ambiguous portable bin under ${context} (flavor=${FLAVOR}):
+$(printf '%s\n' "${list}" | sed '/^$/d' | sed 's/^/  /')
+  Set VASP_PORTABLE_BIN=/path/to/bin, or VASP_BUILD_FLAVOR=<name> / PKG_NAME=..."
+  fi
+  printf '%s\n' "${list}" | sed '/^$/d' | head -1
+}
+
+# Die when CURRENT (or similar) has portable packages but none match FLAVOR.
+die_wrong_flavor_packages() {
+  local context="$1"
+  local list="$2"
+  local expect
+  if [ "${FLAVOR}" = "stock" ]; then
+    expect="…-msys2-portable (no -<flavor> suffix)"
+  else
+    expect="…-msys2-portable-${FLAVOR}"
+  fi
+  die "no exact ${expect} under ${context} (flavor=${FLAVOR}, PKG_NAME=${PKG_NAME}).
+  Found other portable package(s) — refusing silent fallback / stock auto-adopt:
+$(printf '%s\n' "${list}" | sed '/^$/d' | sed 's/^/  /')
+  Set VASP_PORTABLE_BIN=/path/to/bin, PKG_NAME=<exact-dir>, or VASP_BUILD_FLAVOR=<name>
+  to match a candidate."
+}
+
+# build_work/<flavor>/<stamp> prefix for a path (empty if outside BUILD_WORK_ROOT).
+build_work_stamp_key() {
+  local path="$1"
+  local bw root_n path_n rel flavor_part rest stamp_part
+  bw="$(to_msys_path "${BUILD_WORK_ROOT}")"
+  root_n="$(cd "${bw}" 2>/dev/null && pwd -P)" || return 1
+  path_n="$(cd "$(dirname "${path}")" 2>/dev/null && pwd -P)/$(basename "${path}")" || path_n="${path}"
+  case "${path_n}" in
+    "${root_n}"/*) ;;
+    *) return 1 ;;
+  esac
+  rel="${path_n#"${root_n}"/}"
+  flavor_part="${rel%%/*}"
+  rest="${rel#*/}"
+  [ "${rest}" != "${rel}" ] || return 1
+  stamp_part="${rest%%/*}"
+  [ -n "${flavor_part}" ] && [ -n "${stamp_part}" ] || return 1
+  # Require stamp dir shape (not bare CURRENT file path as stamp)
+  [ -d "${root_n}/${flavor_part}/${stamp_part}" ] || return 1
+  printf '%s/%s' "${flavor_part}" "${stamp_part}"
+}
+
+read_flavor_current_stamp() {
+  local cf="${BUILD_WORK_ROOT}/${FLAVOR}/CURRENT"
+  local stamp
+  [ -f "${cf}" ] || return 1
+  stamp="$(tr -d '\r\n' < "${cf}")"
+  [ -n "${stamp}" ] || return 1
+  stamp="$(to_msys_path "${stamp}")"
+  [ -d "${stamp}" ] || return 1
+  printf '%s' "${stamp}"
+}
+
+find_testsuite_under() {
+  local root="$1"
+  local cand rt
+  [ -d "${root}" ] || return 1
+  shopt -s nullglob
+  for cand in "${root}"/vasp.*/testsuite "${root}"/testsuite; do
+    if [ -f "${cand}/runtest" ]; then
+      shopt -u nullglob
+      printf '%s' "${cand}"
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  # stamp/vasp.*/testsuite/runtest → depth 3 from stamp; +1–2 from flavor root
+  while IFS= read -r rt; do
+    [ -n "${rt}" ] || continue
+    printf '%s' "$(dirname "${rt}")"
+    return 0
+  done < <(find "${root}" -maxdepth 5 -type f -name runtest -path '*/testsuite/runtest' 2>/dev/null | sort -r)
+  return 1
+}
+
+# Prefer PKG_NAME/bin under a stamp/root when present.
+try_pkg_name_bin() {
+  local root="$1"
+  local b="${root}/${PKG_NAME}/bin"
+  if bin_has_vasp "${b}"; then
+    printf '%s' "${b}"
+    return 0
+  fi
+  return 1
 }
 
 #-----------------------------------------------------------------------------
@@ -68,16 +287,28 @@ resolve_testsuite_root() {
     fi
   fi
 
-  local cand ts
-  # Prefer build_work/vasp.*/testsuite (find returns .../testsuite/runtest file path)
-  if [ -d "${WORK_DIR}" ]; then
-    while IFS= read -r cand; do
-      ts="$(dirname "${cand}")"
-      if [ -f "${ts}/runtest" ]; then
-        printf '%s' "${ts}"
-        return 0
-      fi
-    done < <(find "${WORK_DIR}" -maxdepth 3 -type f -name runtest -path '*/testsuite/runtest' 2>/dev/null | sort -r)
+  local stamp ts
+  if stamp="$(read_flavor_current_stamp)"; then
+    if ts="$(find_testsuite_under "${stamp}")"; then
+      printf '%s' "${ts}"
+      return 0
+    fi
+  fi
+
+  # Explicit WORK_DIR when it is a stamp (or contains vasp.*/testsuite)
+  if [ -d "${WORK_DIR}" ] && [ "${WORK_DIR}" != "${BUILD_WORK_ROOT}" ]; then
+    if ts="$(find_testsuite_under "$(to_msys_path "${WORK_DIR}")")"; then
+      printf '%s' "${ts}"
+      return 0
+    fi
+  fi
+
+  # Flavor-scoped stamps: build_work/<flavor>/<stamp>/vasp.*/testsuite
+  if [ -d "${BUILD_WORK_ROOT}/${FLAVOR}" ]; then
+    if ts="$(find_testsuite_under "${BUILD_WORK_ROOT}/${FLAVOR}")"; then
+      printf '%s' "${ts}"
+      return 0
+    fi
   fi
 
   # Hard-disabled: repo-root /testsuite is for human/agent inspection only.
@@ -85,44 +316,100 @@ resolve_testsuite_root() {
     warn "found ${REPO_ROOT}/testsuite (inspection-only copy; not used for runtest)"
   fi
 
-  die "could not find an extracted VASP testsuite with runtest.
-  Unpack your licensed VASP tarball (e.g. under WORK_DIR=${WORK_DIR}),
+  die "could not find an extracted VASP testsuite with runtest for flavor=${FLAVOR}.
+  Unpack your licensed VASP tarball under build_work/${FLAVOR}/<stamp>/,
   or set TESTSUITE_ROOT=/path/to/vasp.*/testsuite
   (repo-root /testsuite is inspection-only and is never used to run tests)."
 }
 
 #-----------------------------------------------------------------------------
-# Locate portable bin/ (mpiexec + vasp_*.exe)
+# Locate portable bin/ (mpiexec + vasp_*.exe) — generic flavor
+# Order: VASP_PORTABLE_BIN > PKG_NAME/CURRENT harvest > exact flavor pattern >
+#        WORK_DIR > repo-root > flavor stamps under build_work
+# Never silently use a mismatched …-portable* (non-stock miss or stock→other).
 #-----------------------------------------------------------------------------
 resolve_portable_bin() {
   if [ -n "${VASP_PORTABLE_BIN:-}" ]; then
     local b
     b="$(to_msys_path "${VASP_PORTABLE_BIN}")"
     [ -d "$b" ] || die "VASP_PORTABLE_BIN not a directory: ${b}"
+    bin_has_vasp "$b" || die "VASP_PORTABLE_BIN has no vasp_std.exe: ${b}"
     printf '%s' "$b"
     return 0
   fi
 
-  local cand
-  for cand in \
-    "${REPO_ROOT}/vasp-6.6.0-msys2-portable/bin" \
-    "${WORK_DIR}/vasp-6.6.0-msys2-portable/bin"
-  do
-    if [ -x "${cand}/vasp_std.exe" ] || [ -f "${cand}/vasp_std.exe" ]; then
-      printf '%s' "$cand"
+  local stamp cand list other
+
+  if stamp="$(read_flavor_current_stamp)"; then
+    if cand="$(try_pkg_name_bin "${stamp}")"; then
+      printf '%s' "${cand}"
       return 0
     fi
-  done
-
-  # Any unpacked portable package under repo or WORK_DIR
-  while IFS= read -r cand; do
-    if [ -f "${cand}/vasp_std.exe" ]; then
-      printf '%s' "$cand"
+    list="$(collect_portable_bins_under "${stamp}" 1 || true)"
+    if cand="$(pick_unique_bin_or_die "CURRENT stamp ${stamp}" "${list}")"; then
+      printf '%s' "${cand}"
       return 0
     fi
-  done < <(find "${REPO_ROOT}" "${WORK_DIR}" -maxdepth 3 -type d -name bin 2>/dev/null | sort -r)
+    # Exact flavor missing under CURRENT: die if any other …-portable* is present
+    # (no warn-and-continue with the wrong bin; stock never auto-adopts -<other>).
+    other="$(collect_portable_bins_under "${stamp}" 0 || true)"
+    if [ -n "$(printf '%s' "${other}" | sed '/^$/d')" ]; then
+      die_wrong_flavor_packages "CURRENT stamp ${stamp}" "${other}"
+    fi
+    warn "CURRENT stamp has no portable bin (PKG_NAME=${PKG_NAME}): ${stamp}"
+  fi
 
-  die "could not find portable bin/ with vasp_std.exe. Set VASP_PORTABLE_BIN=..."
+  if [ -d "${WORK_DIR}" ] && [ "${WORK_DIR}" != "${BUILD_WORK_ROOT}" ]; then
+    local wd
+    wd="$(to_msys_path "${WORK_DIR}")"
+    if cand="$(try_pkg_name_bin "${wd}")"; then
+      printf '%s' "${cand}"
+      return 0
+    fi
+    list="$(collect_portable_bins_under "${wd}" 1 || true)"
+    if cand="$(pick_unique_bin_or_die "WORK_DIR ${wd}" "${list}")"; then
+      printf '%s' "${cand}"
+      return 0
+    fi
+  fi
+
+  # Repo-root package dirs (exact flavor only — no sole-non-stock adoption)
+  list="$(collect_portable_bins_under "${REPO_ROOT}" 1 || true)"
+  if cand="$(pick_unique_bin_or_die "repo root" "${list}")"; then
+    printf '%s' "${cand}"
+    return 0
+  fi
+
+  # Deeper under build_work/<flavor>/<stamp>/…
+  if [ -d "${BUILD_WORK_ROOT}/${FLAVOR}" ]; then
+    if cand="$(try_pkg_name_bin "${BUILD_WORK_ROOT}/${FLAVOR}")"; then
+      printf '%s' "${cand}"
+      return 0
+    fi
+    list="$(collect_portable_bins_under "${BUILD_WORK_ROOT}/${FLAVOR}" 1 || true)"
+    if cand="$(pick_unique_bin_or_die "build_work/${FLAVOR}" "${list}")"; then
+      printf '%s' "${cand}"
+      return 0
+    fi
+    # stamp-nested packages: flavor/<stamp>/vasp-*-msys2-portable*/bin
+    list=""
+    while IFS= read -r cand; do
+      [ -n "${cand}" ] || continue
+      bin_has_vasp "${cand}" || continue
+      if pkg_basename_matches_flavor "$(basename "$(dirname "${cand}")")"; then
+        list="${list}${cand}"$'\n'
+      fi
+    done < <(find "${BUILD_WORK_ROOT}/${FLAVOR}" -maxdepth 4 -type d -name bin 2>/dev/null | sort -r)
+    if cand="$(pick_unique_bin_or_die "build_work/${FLAVOR} stamps" "${list}")"; then
+      printf '%s' "${cand}"
+      return 0
+    fi
+  fi
+
+  die "could not find flavor=${FLAVOR} portable bin/ with vasp_std.exe (expected PKG_NAME=${PKG_NAME}).
+  Set VASP_PORTABLE_BIN=..., or run a ${FLAVOR} release so build_work/${FLAVOR}/CURRENT
+  points at a stamp containing ${PKG_NAME}/bin (convention: stock → …-msys2-portable;
+  other flavors → …-msys2-portable-<flavor>; no silent cross-flavor fallback)."
 }
 
 #-----------------------------------------------------------------------------
@@ -201,18 +488,34 @@ OVERLAY_CONF_NAME="msys2_msmpi_${MODE}.conf"
 CONF_BASENAME="${OVERLAY_CONF_NAME}"
 
 #-----------------------------------------------------------------------------
-# Main
+# Main (env + flavor already resolved above)
 #-----------------------------------------------------------------------------
-# Optional: source UCRT64 env when available (PATH / MINGW_PREFIX)
-if [ -f "${SCRIPT_DIR}/env_ucrt64.sh" ] && [ "${SKIP_ENV_UCRT64:-}" != "1" ]; then
-  # shellcheck disable=SC1091
-  source "${SCRIPT_DIR}/env_ucrt64.sh" || warn "env_ucrt64.sh returned non-zero; continuing"
-fi
+log "VASP_BUILD_FLAVOR=${VASP_BUILD_FLAVOR} VASP_VTST=${VASP_VTST} (explicit=${FLAVOR_EXPLICIT}) PKG_NAME=${PKG_NAME}"
 
 TESTSUITE_ROOT="$(resolve_testsuite_root)"
 VASP_PORTABLE_BIN="$(resolve_portable_bin)"
 VASP_PORTABLE_BIN="$(cd "${VASP_PORTABLE_BIN}" && pwd -P)"
 TESTSUITE_ROOT="$(cd "${TESTSUITE_ROOT}" && pwd -P)"
+
+log "VASP_PORTABLE_BIN=${VASP_PORTABLE_BIN}"
+log "TESTSUITE_ROOT=${TESTSUITE_ROOT}"
+
+# Loud warning when bin and testsuite sit under different build_work stamps.
+_bin_stamp="$(build_work_stamp_key "${VASP_PORTABLE_BIN}" || true)"
+_ts_stamp="$(build_work_stamp_key "${TESTSUITE_ROOT}" || true)"
+if [ -n "${_bin_stamp}" ] && [ -n "${_ts_stamp}" ] && [ "${_bin_stamp}" != "${_ts_stamp}" ]; then
+  warn "portable bin and testsuite come from different build_work stamps:
+  bin:       build_work/${_bin_stamp}  (${VASP_PORTABLE_BIN})
+  testsuite: build_work/${_ts_stamp}  (${TESTSUITE_ROOT})
+  Prefer matching CURRENT / VASP_PORTABLE_BIN / TESTSUITE_ROOT for the same release."
+fi
+unset _bin_stamp _ts_stamp
+
+# Resolve-only smoke: print paths and exit without compare tool / runtest.
+if [ "${TESTSUITE_RESOLVE_ONLY:-0}" = "1" ]; then
+  log "TESTSUITE_RESOLVE_ONLY=1 — skipping compare tool and runtest"
+  exit 0
+fi
 
 OVERLAY_SRC="${OVERLAY_DIR}/${OVERLAY_CONF_NAME}"
 [ -f "${OVERLAY_SRC}" ] || die "overlay conf missing: ${OVERLAY_SRC}"
@@ -228,8 +531,6 @@ export VASP_PORTABLE_BIN
 export VASP_TESTSUITE_NRANKS="${VASP_TESTSUITE_NRANKS:-4}"
 
 log "MODE=${MODE}"
-log "TESTSUITE_ROOT=${TESTSUITE_ROOT}"
-log "VASP_PORTABLE_BIN=${VASP_PORTABLE_BIN}"
 log "overlay=${OVERLAY_CONF_NAME}"
 if [ -n "${VASP_TESTSUITE_TESTS:-}" ]; then
   log "single/selected recipes: VASP_TESTSUITE_TESTS=${VASP_TESTSUITE_TESTS}"

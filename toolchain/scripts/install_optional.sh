@@ -5,6 +5,12 @@
 # Builds HDF5 / LibXC / Wannier90 / DFTD4 into toolchain/install/<pkg>-<ver>,
 # then writes the aggregate toolchain/install/setup for CMAKE_PREFIX_PATH.
 #
+# Supported package names (install_<name>.sh): hdf5 libxc wannier90 dftd4 vtst
+# Default OPTIONAL_LIBS omits vtst (most users do not need the overlay fetch).
+# To also fetch vtstcode:
+#   OPTIONAL_LIBS="hdf5 libxc wannier90 dftd4 vtst" bash toolchain/scripts/install_optional.sh
+#   # or alone: bash toolchain/scripts/install_vtst.sh
+#
 # Usage (MSYS2 UCRT64, from repo root):
 #   bash toolchain/scripts/install_optional.sh
 #   OPTIONAL_LIBS="hdf5 libxc" bash toolchain/scripts/install_optional.sh
@@ -23,6 +29,7 @@ source "${TOOLCHAIN_ROOT}/lib/tool_kit.sh"
 SCRIPT_NAME="install_optional.sh"
 BUILDDIR="${TOOLCHAIN_BUILDDIR:-${TOOLCHAIN_ROOT}/build}"
 INSTALL_ROOT="${TOOLCHAIN_INSTALL_ROOT:-${TOOLCHAIN_ROOT}/install}"
+# Default: compiled optional libs only. Add "vtst" explicitly when needed.
 OPTIONAL_LIBS="${OPTIONAL_LIBS:-hdf5 libxc wannier90 dftd4}"
 # 0 = run real install scripts (default); 1 = pin-check only
 OPTIONAL_LIBS_STUB="${OPTIONAL_LIBS_STUB:-0}"

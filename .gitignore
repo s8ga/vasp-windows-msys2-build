@@ -10,6 +10,7 @@ vasp.*/
 *.zip
 *.sha256
 vasp-*-msys2-portable/
+vasp-*-msys2-portable-vtst/
 
 # Source / archive inputs (licensed — never commit)
 *.tgz
