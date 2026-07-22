@@ -325,6 +325,8 @@ no System-V shared memory.
 
 ## License reminder
 
-VASP is proprietary. This repo only contains build glue (scripts, patches, and
-a pointer to the public CMake port). You are responsible for complying with
-your VASP license when obtaining source and running calculations.
+Build glue in this repository (scripts, patches, docs) is released under the
+[MIT License](LICENSE). VASP itself is proprietary. This repo only contains
+build glue and a pointer to the public CMake port. You are responsible for
+complying with your VASP license when obtaining source and running
+calculations.
