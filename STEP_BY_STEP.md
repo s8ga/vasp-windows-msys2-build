@@ -1,8 +1,9 @@
 # VASP Windows Native Build — Step-by-Step Manual
 
 Use this to run the build **one stage at a time** on a Windows host, with a
-checkpoint after each stage. For the automated one-command path, use
-`build_pipeline.sh`.
+checkpoint after each stage. For the automated one-command path, prefer
+`bash toolchain/build_vasp.sh` (sources `env_ucrt64.sh`, then runs
+`build_pipeline.sh`), or call `build_pipeline.sh` directly.
 
 All commands run in the **MSYS2 UCRT64** shell unless noted.
 
@@ -35,7 +36,23 @@ echo "DELIV=$DELIV"; echo "TARBALL=$VASP_TARBALL"
 
 ## Stage 0 — Environment prep (one-time)
 
-### 0.1 Toolchain packages
+### 0.1 Toolchain packages (pacman)
+
+Prefer the repo installer (keeps the package list in sync with the pipeline):
+
+```bash
+bash toolchain/install_deps_msys2.sh
+```
+
+That installs gcc/gfortran, cmake, ninja, msmpi, OpenBLAS, ScaLAPACK, FFTW,
+**zlib**, **dlfcn**, ntldd, git, tar, zip, wget — and **does not** install
+pacman `hdf5` (MSYS2 HDF5 pulls `libaws*` into the portable ZIP).
+
+`dlfcn` (`mingw-w64-ucrt-x86_64-dlfcn`) is required when `VASP_FFTLIB=ON`
+(pipeline default with OpenMP + FFTW): it provides `dlfcn.h` / `libdl` for
+internal fftlib on MinGW.
+
+Equivalent package list (if you must invoke pacman by hand):
 
 ```bash
 pacman -S --needed \
@@ -44,11 +61,26 @@ pacman -S --needed \
   mingw-w64-ucrt-x86_64-ninja \
   mingw-w64-ucrt-x86_64-msmpi \
   mingw-w64-ucrt-x86_64-openblas mingw-w64-ucrt-x86_64-scalapack \
-  mingw-w64-ucrt-x86_64-fftw mingw-w64-ucrt-x86_64-hdf5 \
-  mingw-w64-ucrt-x86_64-ntldd git tar zip
+  mingw-w64-ucrt-x86_64-fftw mingw-w64-ucrt-x86_64-zlib \
+  mingw-w64-ucrt-x86_64-dlfcn \
+  mingw-w64-ucrt-x86_64-ntldd git tar zip wget
 ```
 
-### 0.2 Host Microsoft MPI
+### 0.2 Optional libs (HDF5 / LibXC / Wannier90 / DFTD4) — not pacman
+
+Self-build into `toolchain/install/` (writes aggregate `setup` for
+`CMAKE_PREFIX_PATH`):
+
+```bash
+bash toolchain/scripts/install_optional.sh
+# subset: OPTIONAL_LIBS="hdf5 libxc" bash toolchain/scripts/install_optional.sh
+```
+
+`toolchain/build_vasp.sh` / `build_pipeline.sh` source that setup so optional
+prefixes sit **before** `MINGW_PREFIX`. A bare Stage 4 cmake line below does
+**not** — see the advanced note there.
+
+### 0.3 Host Microsoft MPI
 
 ```powershell
 scoop install msmpi
@@ -56,21 +88,23 @@ scoop install msmpi
 
 or install `msmpisetup.exe` from Microsoft. Provides `mpiexec.exe`, `smpd.exe`,
 `msmpi.dll` for harvesting into the portable package.
+Optional override: `MSMPI_BIN=/c/path/to/Microsoft MPI/Bin`.
 
-### 0.3 Verify
+### 0.4 Verify
 
 ```bash
 gfortran --version | head -1
 cmake --version | head -1
 ninja --version
 ntldd --version 2>&1 | head -1
+ls "$MINGW_PREFIX/include/dlfcn.h"
 ls "$MINGW_PREFIX/lib/libmsmpi.dll.a"
 ls "$MINGW_PREFIX/lib"/libopenblas*.dll.a
 ls "$MINGW_PREFIX/lib"/libscalapack*.dll.a
 ls "$VASP_CMAKE_DIR/setup.sh"
 ```
 
-**Checkpoint:** every command succeeds.
+**Checkpoint:** every command succeeds; `dlfcn.h` present.
 
 ---
 
@@ -150,22 +184,48 @@ See [docs/WIN32_MAXMEM.md](docs/WIN32_MAXMEM.md) and
 
 The automated pipeline also compiles and links the MS-MPI `--wrap` shim at
 configure time ([docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md)).
-Manual Stage 4 below is a minimal cmake line; prefer `build_pipeline.sh` for
-the wrap injects.
 
 ---
 
 ## Stage 4 — Configure (cmake)
 
+**Recommended:** do not hand-roll cmake. Use the real entry points so MS-MPI
+`--wrap` injects, fftlib Win32 inject, and optional-lib `CMAKE_PREFIX_PATH`
+prefixes are applied:
+
+```bash
+# after Stages 0–3 are already done once, or for a full release from tarball:
+bash toolchain/build_vasp.sh "$VASP_TARBALL"
+# or: bash build_pipeline.sh "$VASP_TARBALL"
+# develop rebuild (reuse build_work): see Optional section below
+```
+
+### Advanced / diagnostic only — minimal cmake (unsafe for multi-rank)
+
+The following is a **stripped** configure for debugging Find\* / compiler
+paths. It is **not** equivalent to the pipeline:
+
+- **No** MS-MPI `--wrap` shim inject → multi-process (`mpiexec -n >1`) is
+  unsafe on MSYS2/MS-MPI (see [docs/MSMPI_INPLACE_SHIM.md](docs/MSMPI_INPLACE_SHIM.md)).
+- **No** optional-prefix wiring → self-built HDF5/LibXC/Wannier90/DFTD4 from
+  `install_optional.sh` are not on `CMAKE_PREFIX_PATH` unless you add them.
+- **No** fftlib Win32 CMake inject (`RTLD_NOLOAD` / related) used when
+  `VASP_FFTLIB=ON`.
+
 ```bash
 BDIR="$SRC_ROOT/build"
 rm -rf "$BDIR" && mkdir -p "$BDIR"
+# If you already ran install_optional.sh, prepend its prefixes, e.g.:
+#   source "$DELIV/toolchain/install/setup"
+#   CMAKE_PREFIX="${CMAKE_PREFIX_PATH:+$CMAKE_PREFIX_PATH:}$MINGW_PREFIX"
+CMAKE_PREFIX="${CMAKE_PREFIX_PATH:-$MINGW_PREFIX}"
 cmake -S "$SRC_ROOT" -B "$BDIR" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_Fortran_COMPILER=gfortran \
   -DCMAKE_C_COMPILER=gcc \
-  -DCMAKE_PREFIX_PATH="$MINGW_PREFIX" \
+  -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX" \
   -DVASP_OPENMP=ON \
+  -DVASP_FFTLIB=ON \
   -DVASP_HDF5=ON \
   -DVASP_SCALAPACK=ON \
   -DVASP_SHMEM=OFF \
@@ -179,7 +239,9 @@ cmake -S "$SRC_ROOT" -B "$BDIR" -G Ninja \
   -DMPI_Fortran_LIBRARIES="$MINGW_PREFIX/lib/libmsmpi.dll.a"
 ```
 
-**Checkpoint:** configure finds MPI (Fortran), OpenBLAS, ScaLAPACK, FFTW, HDF5.
+**Checkpoint (pipeline path):** configure succeeds with wrap/fftlib injects and
+optional prefixes. **Checkpoint (minimal cmake):** Find\* may pass, but do not
+treat the binary as multi-rank–safe.
 
 ---
 
@@ -261,7 +323,7 @@ After one successful full unpack/configure (or a prior `release` run), iterate
 on shims / patches without wiping `build_work`:
 
 ```bash
-VASP_PIPELINE_MODE=develop VASP_TARBALL="$VASP_TARBALL" bash "$DELIV/build_pipeline.sh"
+VASP_PIPELINE_MODE=develop VASP_TARBALL="$VASP_TARBALL" bash "$DELIV/toolchain/build_vasp.sh"
 # or: bash "$DELIV/build_pipeline.sh" --develop "$VASP_TARBALL"
 # Copy new build/bin/vasp_*.exe over an existing portable bin/ for testsuite.
 ```
@@ -275,11 +337,14 @@ See [docs/DESIGN.md](docs/DESIGN.md).
 
 | Stage | Symptom | Check |
 |---|---|---|
-| 0 | package not found | `pacman -Syu` then retry |
+| 0 | package not found | `pacman -Syu` then `bash toolchain/install_deps_msys2.sh` |
+| 0 | missing `dlfcn.h` / fftlib fail | install `mingw-w64-ucrt-x86_64-dlfcn` (in `install_deps_msys2.sh`) |
+| 0 | HDF5 / `libaws*` from pacman | do **not** `pacman -S …-hdf5`; use `install_optional.sh` |
 | 0 | missing `vasp_cmake/setup.sh` | `git submodule update --init --recursive` |
 | 2 | CMake cannot see CMakeLists | materialize symlinks (Stage 2) |
 | 3 | patch rejected | already applied, or tarball version differs |
-| 4 | MPI/OpenBLAS not found | packages + MPI Fortran hints in Stage 4 |
+| 4 | MPI/OpenBLAS/HDF5 not found | deps + optional setup; prefer `build_vasp.sh` / pipeline |
+| 4 | multi-rank crash after hand cmake | missing MS-MPI wrap inject — use pipeline, not minimal cmake |
 | 5 | `getrusage` link error | Stage 3 patches not active |
 | 5 | stack overflow `0xc00000fd` | confirm `-Wl,--stack,268435456` |
 | 5 | OpenBLAS under MPI | keep `OMP_NUM_THREADS=1` |
