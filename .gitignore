@@ -43,10 +43,8 @@ Desktop.ini
 *.swo
 .vscode/
 .idea/
-# Cursor local state; keep committed agent rules
-.cursor/*
-!.cursor/rules/
-!.cursor/rules/**
+# Cursor local state (never commit)
+.cursor/
 
 # Local env / secrets
 .env
